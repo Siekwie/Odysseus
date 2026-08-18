@@ -1,0 +1,16 @@
+*.exe
+*.pdb
+*.obj
+*.ll
+*.bc
+/*.dll
+/build/*
+.DS_Store
+vendor/ffmpeg/_extracted/
+vendor/ffmpeg/_ffmpeg.zip
+vendor/libdatachannel/upstream/
+vendor/libdatachannel/build/
+vendor/libdatachannel/bin/*.def
+vendor/libdatachannel/lib/*.dll.a
+vendor/mbedtls/
+initREPO.sh
