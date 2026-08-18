@@ -53,6 +53,12 @@ when STUB_LIBS {
 	av_hwdevice_iterate_types :: proc "c" (prev: HW_Device_Type) -> HW_Device_Type { return .None }
 	av_buffer_ref :: proc "c" (buf: ^AVBuffer_Ref) -> ^AVBuffer_Ref { return nil }
 	av_buffer_unref :: proc "c" (buf: ^^AVBuffer_Ref) {}
+	av_hwdevice_ctx_alloc :: proc "c" (_: HW_Device_Type) -> ^AVBuffer_Ref { return nil }
+	av_hwdevice_ctx_init :: proc "c" (_: ^AVBuffer_Ref) -> i32 { return -1 }
+	av_hwframe_ctx_alloc :: proc "c" (_: ^AVBuffer_Ref) -> ^AVBuffer_Ref { return nil }
+	av_hwframe_ctx_init :: proc "c" (_: ^AVBuffer_Ref) -> i32 { return -1 }
+	av_hwframe_get_buffer :: proc "c" (_: ^AVBuffer_Ref, _: ^AVFrame, _: i32) -> i32 { return -1 }
+	av_get_pix_fmt :: proc "c" (_: cstring) -> Pixel_Format { return PIX_FMT_NONE }
 } else {
 	@(default_calling_convention = "c")
 	foreign avutil {
@@ -102,5 +108,11 @@ when STUB_LIBS {
 		av_hwdevice_iterate_types :: proc(prev: HW_Device_Type) -> HW_Device_Type ---
 		av_buffer_ref :: proc(buf: ^AVBuffer_Ref) -> ^AVBuffer_Ref ---
 		av_buffer_unref :: proc(buf: ^^AVBuffer_Ref) ---
+		av_hwdevice_ctx_alloc :: proc(type: HW_Device_Type) -> ^AVBuffer_Ref ---
+		av_hwdevice_ctx_init :: proc(ref: ^AVBuffer_Ref) -> i32 ---
+		av_hwframe_ctx_alloc :: proc(device_ref: ^AVBuffer_Ref) -> ^AVBuffer_Ref ---
+		av_hwframe_ctx_init :: proc(ref: ^AVBuffer_Ref) -> i32 ---
+		av_hwframe_get_buffer :: proc(hwframe_ctx: ^AVBuffer_Ref, frame: ^AVFrame, flags: i32) -> i32 ---
+		av_get_pix_fmt :: proc(name: cstring) -> Pixel_Format ---
 	}
 }

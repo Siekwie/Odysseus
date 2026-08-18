@@ -6,6 +6,10 @@
 /*.dll
 /build/*
 .DS_Store
+.serena/
+.cursor/
+.vscode/
+/tools/
 vendor/ffmpeg/_extracted/
 vendor/ffmpeg/_ffmpeg.zip
 vendor/libdatachannel/upstream/

@@ -1,6 +1,8 @@
 package core
 
-// CPU BGRA frame produced by a capture backend. Encoder converts this to YUV.
+// CPU BGRA or GPU D3D11 frame produced by a capture backend.
+
+import d3d11 "vendor:directx/d3d11"
 
 Pixel_Format :: enum {
 	BGRA,
@@ -9,10 +11,12 @@ Pixel_Format :: enum {
 Frame :: struct {
 	width:        int,
 	height:       int,
-	stride:       int, // bytes per row, may be > width * 4
+	stride:       int, // bytes per row for CPU frames
 	format:       Pixel_Format,
 	data:         []byte,
 	timestamp_ns: i64,
+	gpu:          bool,
+	texture:      ^d3d11.ITexture2D, // valid when gpu == true
 }
 
 Capture :: struct {
@@ -20,6 +24,7 @@ Capture :: struct {
 	height:  int,
 	monitor: int,
 	impl:    rawptr,
+	gpu:     bool,
 }
 
 Capture_Error :: enum {
@@ -31,9 +36,9 @@ Capture_Error :: enum {
 	Failed,
 }
 
-capture_open :: proc(monitor: int, draw_cursor := true) -> (cap: Capture, err: Capture_Error) {
+capture_open :: proc(monitor: int, draw_cursor := true, prefer_gpu := true) -> (cap: Capture, err: Capture_Error) {
 	when ODIN_OS == .Windows {
-		return capture_open_dxgi(monitor, draw_cursor)
+		return capture_open_dxgi(monitor, draw_cursor, prefer_gpu)
 	} else {
 		return {}, .Not_Implemented
 	}
@@ -46,11 +51,23 @@ capture_close :: proc(cap: ^Capture) {
 }
 
 // Grab the next desktop frame into `out`. Returns .Device_Lost if DXGI duplication
-// must be recreated. `out.data` is valid until the next capture_frame or capture_close.
+// must be recreated. CPU `out.data` is valid until the next capture_frame or capture_close.
+// GPU `out.texture` is owned by capture until the next capture_frame or capture_close.
 capture_frame :: proc(cap: ^Capture, out: ^Frame) -> Capture_Error {
 	when ODIN_OS == .Windows {
 		return capture_frame_dxgi(cap, out)
 	} else {
 		return .Not_Implemented
 	}
+}
+
+capture_d3d11 :: proc(cap: ^Capture) -> (device: ^d3d11.IDevice, imm: ^d3d11.IDeviceContext, ok: bool) {
+	when ODIN_OS == .Windows {
+		return capture_d3d11_dxgi(cap)
+	}
+	return nil, nil, false
+}
+
+capture_uses_gpu :: proc(cap: ^Capture) -> bool {
+	return cap.gpu
 }

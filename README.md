@@ -306,7 +306,7 @@ Odysseus/
 - [x] WebRTC signaling server
 - [x] Browser viewer at `/odysseus`
 - [x] Mouse cursor capture
-- [ ] Configurable monitor selection
+- [ ] Configurable monitor selection and checkbox to enable/disable text/UI overlay
 - [ ] Linux PipeWire capture support (LATER)
 - [ ] macOS ScreenCaptureKit support (LATER)
 - [ ] Audio streaming (LATER)

@@ -12,6 +12,8 @@ Capture_DXGI :: struct {
 	immediate:   ^d3d11.IDeviceContext,
 	duplication: ^dxgi.IOutputDuplication,
 	staging:     ^d3d11.ITexture2D,
+	frame_tex:   ^d3d11.ITexture2D,
+	cursor_box:  ^d3d11.ITexture2D,
 	cpu:         []byte,
 	width:       int,
 	height:      int,
@@ -19,6 +21,7 @@ Capture_DXGI :: struct {
 	desktop_x:   int,
 	desktop_y:   int,
 	draw_cursor: bool,
+	gpu:         bool,
 
 	cursor_visible:    bool,
 	cursor_x:          int,
@@ -31,7 +34,9 @@ Capture_DXGI :: struct {
 	cursor_win32:      win32.HCURSOR,
 }
 
-capture_open_dxgi :: proc(monitor: int, draw_cursor := true) -> (cap: Capture, err: Capture_Error) {
+CURSOR_BOX_MAX :: 256
+
+capture_open_dxgi :: proc(monitor: int, draw_cursor := true, prefer_gpu := true) -> (cap: Capture, err: Capture_Error) {
 	factory: ^dxgi.IFactory1
 	if win32.FAILED(dxgi.CreateDXGIFactory1(dxgi.IFactory1_UUID, (^rawptr)(&factory))) {
 		return {}, .Failed
@@ -55,7 +60,7 @@ capture_open_dxgi :: proc(monitor: int, draw_cursor := true) -> (cap: Capture, e
 		adapter,
 		.UNKNOWN,
 		nil,
-		{},
+		{.VIDEO_SUPPORT},
 		nil,
 		0,
 		d3d11.SDK_VERSION,
@@ -93,22 +98,58 @@ capture_open_dxgi :: proc(monitor: int, draw_cursor := true) -> (cap: Capture, e
 		return {}, .Failed
 	}
 
-	staging_desc := d3d11.TEXTURE2D_DESC{
-		Width          = u32(w),
-		Height         = u32(h),
-		MipLevels      = 1,
-		ArraySize      = 1,
-		Format         = .B8G8R8A8_UNORM,
-		SampleDesc     = {Count = 1, Quality = 0},
-		Usage          = .STAGING,
-		CPUAccessFlags = {.READ},
-	}
 	staging: ^d3d11.ITexture2D
-	if win32.FAILED(device->CreateTexture2D(&staging_desc, nil, &staging)) {
-		duplication->Release()
-		device->Release()
-		immediate->Release()
-		return {}, .Failed
+	frame_tex: ^d3d11.ITexture2D
+	cursor_box: ^d3d11.ITexture2D
+	use_gpu := prefer_gpu
+
+	if use_gpu {
+		frame_desc := d3d11.TEXTURE2D_DESC{
+			Width          = u32(w),
+			Height         = u32(h),
+			MipLevels      = 1,
+			ArraySize      = 1,
+			Format         = .B8G8R8A8_UNORM,
+			SampleDesc     = {Count = 1, Quality = 0},
+			Usage          = .DEFAULT,
+			BindFlags      = {.SHADER_RESOURCE, .RENDER_TARGET},
+		}
+		if win32.FAILED(device->CreateTexture2D(&frame_desc, nil, &frame_tex)) {
+			use_gpu = false
+		} else {
+			box_desc := frame_desc
+			box_desc.Width = CURSOR_BOX_MAX
+			box_desc.Height = CURSOR_BOX_MAX
+			box_desc.Usage = .STAGING
+			box_desc.BindFlags = {}
+			box_desc.CPUAccessFlags = {.READ, .WRITE}
+			if win32.FAILED(device->CreateTexture2D(&box_desc, nil, &cursor_box)) {
+				frame_tex->Release()
+				frame_tex = nil
+				use_gpu = false
+			}
+		}
+	}
+
+	if !use_gpu {
+		staging_desc := d3d11.TEXTURE2D_DESC{
+			Width          = u32(w),
+			Height         = u32(h),
+			MipLevels      = 1,
+			ArraySize      = 1,
+			Format         = .B8G8R8A8_UNORM,
+			SampleDesc     = {Count = 1, Quality = 0},
+			Usage          = .STAGING,
+			CPUAccessFlags = {.READ},
+		}
+		if win32.FAILED(device->CreateTexture2D(&staging_desc, nil, &staging)) {
+			if frame_tex != nil { frame_tex->Release() }
+			if cursor_box != nil { cursor_box->Release() }
+			duplication->Release()
+			device->Release()
+			immediate->Release()
+			return {}, .Failed
+		}
 	}
 
 	impl := new(Capture_DXGI)
@@ -116,15 +157,21 @@ capture_open_dxgi :: proc(monitor: int, draw_cursor := true) -> (cap: Capture, e
 	impl.immediate = immediate
 	impl.duplication = duplication
 	impl.staging = staging
+	impl.frame_tex = frame_tex
+	impl.cursor_box = cursor_box
 	impl.width = w
 	impl.height = h
 	impl.stride = w * 4
-	impl.cpu = make([]byte, impl.stride * h)
+	if use_gpu {
+		impl.gpu = true
+	} else {
+		impl.cpu = make([]byte, impl.stride * h)
+	}
 	impl.desktop_x = int(od.DesktopCoordinates.left)
 	impl.desktop_y = int(od.DesktopCoordinates.top)
 	impl.draw_cursor = draw_cursor
 
-	return Capture{width = w, height = h, monitor = monitor, impl = impl}, .None
+	return Capture{width = w, height = h, monitor = monitor, impl = impl, gpu = use_gpu}, .None
 }
 
 capture_close_dxgi :: proc(cap: ^Capture) {
@@ -133,6 +180,8 @@ capture_close_dxgi :: proc(cap: ^Capture) {
 	}
 	impl := (^Capture_DXGI)(cap.impl)
 	if impl.staging != nil { impl.staging->Release() }
+	if impl.frame_tex != nil { impl.frame_tex->Release() }
+	if impl.cursor_box != nil { impl.cursor_box->Release() }
 	if impl.duplication != nil { impl.duplication->Release() }
 	if impl.immediate != nil { impl.immediate->Release() }
 	if impl.device != nil { impl.device->Release() }
@@ -140,6 +189,14 @@ capture_close_dxgi :: proc(cap: ^Capture) {
 	delete(impl.cursor_shape)
 	free(impl)
 	cap.impl = nil
+}
+
+capture_d3d11_dxgi :: proc(cap: ^Capture) -> (device: ^d3d11.IDevice, imm: ^d3d11.IDeviceContext, ok: bool) {
+	if cap.impl == nil || !cap.gpu {
+		return nil, nil, false
+	}
+	impl := (^Capture_DXGI)(cap.impl)
+	return impl.device, impl.immediate, true
 }
 
 capture_frame_dxgi :: proc(cap: ^Capture, out: ^Frame) -> Capture_Error {
@@ -168,6 +225,25 @@ capture_frame_dxgi :: proc(cap: ^Capture, out: ^Frame) -> Capture_Error {
 		return .Failed
 	}
 	defer tex->Release()
+
+	if impl.gpu && impl.frame_tex != nil {
+		impl.immediate->CopyResource((^d3d11.IResource)(impl.frame_tex), (^d3d11.IResource)(tex))
+		if impl.draw_cursor {
+			capture_update_cursor(impl, &info)
+			if impl.cursor_visible {
+				capture_blit_cursor_gpu(impl)
+			}
+		}
+		out^ = Frame{
+			width        = impl.width,
+			height       = impl.height,
+			format       = .BGRA,
+			timestamp_ns = time.to_unix_nanoseconds(time.now()),
+			gpu          = true,
+			texture      = impl.frame_tex,
+		}
+		return .None
+	}
 
 	impl.immediate->CopyResource((^d3d11.IResource)(impl.staging), (^d3d11.IResource)(tex))
 
@@ -199,6 +275,103 @@ capture_frame_dxgi :: proc(cap: ^Capture, out: ^Frame) -> Capture_Error {
 		timestamp_ns = time.to_unix_nanoseconds(time.now()),
 	}
 	return .None
+}
+
+@(private)
+capture_blit_cursor_gpu :: proc(impl: ^Capture_DXGI) {
+	if impl.cursor_info.Width == 0 || impl.cursor_info.Height == 0 || len(impl.cursor_shape) == 0 {
+		return
+	}
+	if impl.frame_tex == nil || impl.cursor_box == nil {
+		return
+	}
+
+	cw := int(impl.cursor_info.Width)
+	ch := int(impl.cursor_info.Height)
+	if impl.cursor_info.Type == .MONOCHROME {
+		ch /= 2
+	}
+	x0 := max(0, impl.cursor_x)
+	y0 := max(0, impl.cursor_y)
+	x1 := min(impl.width, impl.cursor_x + cw)
+	y1 := min(impl.height, impl.cursor_y + ch)
+	bw := x1 - x0
+	bh := y1 - y0
+	if bw <= 0 || bh <= 0 || bw > CURSOR_BOX_MAX || bh > CURSOR_BOX_MAX {
+		return
+	}
+
+	src_box := d3d11.BOX{
+		left   = u32(x0),
+		top    = u32(y0),
+		front  = 0,
+		right  = u32(x1),
+		bottom = u32(y1),
+		back   = 1,
+	}
+	impl.immediate->CopySubresourceRegion(
+		(^d3d11.IResource)(impl.cursor_box),
+		0, 0, 0, 0,
+		(^d3d11.IResource)(impl.frame_tex),
+		0,
+		&src_box,
+	)
+
+	mapped: d3d11.MAPPED_SUBRESOURCE
+	if win32.FAILED(impl.immediate->Map((^d3d11.IResource)(impl.cursor_box), 0, .READ_WRITE, {}, &mapped)) {
+		return
+	}
+	box_stride := int(mapped.RowPitch)
+	pixel_stride := bw * 4
+	box_pixels := make([]byte, pixel_stride * bh)
+	defer delete(box_pixels)
+	for y in 0 ..< bh {
+		src_off := y * box_stride
+		dst_off := y * pixel_stride
+		copy(box_pixels[dst_off:dst_off + pixel_stride], ([^]byte)(mapped.pData)[src_off:src_off + pixel_stride])
+	}
+
+	old_stride := impl.stride
+	old_cpu := impl.cpu
+	old_w := impl.width
+	old_h := impl.height
+	impl.stride = pixel_stride
+	impl.cpu = box_pixels
+	impl.width = bw
+	impl.height = bh
+	ox, oy := impl.cursor_x, impl.cursor_y
+	impl.cursor_x -= x0
+	impl.cursor_y -= y0
+	capture_blit_cursor(impl)
+	impl.cursor_x = ox
+	impl.cursor_y = oy
+	impl.stride = old_stride
+	impl.cpu = old_cpu
+	impl.width = old_w
+	impl.height = old_h
+
+	for y in 0 ..< bh {
+		src_off := y * pixel_stride
+		dst_off := y * box_stride
+		copy(([^]byte)(mapped.pData)[dst_off:dst_off + pixel_stride], box_pixels[src_off:src_off + pixel_stride])
+	}
+	impl.immediate->Unmap((^d3d11.IResource)(impl.cursor_box), 0)
+
+	cursor_box := d3d11.BOX{
+		left   = 0,
+		top    = 0,
+		front  = 0,
+		right  = u32(bw),
+		bottom = u32(bh),
+		back   = 1,
+	}
+	impl.immediate->CopySubresourceRegion(
+		(^d3d11.IResource)(impl.frame_tex),
+		0, u32(x0), u32(y0), 0,
+		(^d3d11.IResource)(impl.cursor_box),
+		0,
+		&cursor_box,
+	)
 }
 
 @(private)

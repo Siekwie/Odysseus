@@ -49,15 +49,15 @@ h264_select_from_offer :: proc(sdp: string) -> (pt: int, fmtp: string, ok: bool)
 }
 
 h264_answer_profile :: proc(offer_fmtp, encoder_profile: string) -> string {
+	// Encoder fmtp carries the correct profile-level-id and cached SPS/PPS.
+	if encoder_profile != "" {
+		return encoder_profile
+	}
 	base := offer_fmtp
 	if base == "" {
 		base = rtc.H264_WEBRTC_PROFILE
 	}
-	sprop := sprop_from_profile(encoder_profile)
-	if sprop == "" || strings.contains(base, "sprop-parameter-sets=") {
-		return base
-	}
-	return fmt.tprintf("%s;sprop-parameter-sets=%s", base, sprop)
+	return base
 }
 
 @(private)

@@ -57,7 +57,11 @@ AVRational :: struct {
 }
 
 AVDictionary    :: struct {}
-AVBuffer_Ref    :: struct {}
+AVBuffer_Ref :: struct {
+	buffer: rawptr,
+	data:   rawptr,
+	size:   uint, // size_t on FFmpeg win64
+}
 Sws_Context     :: struct {}
 Sws_Filter      :: struct {}
 
@@ -99,7 +103,7 @@ AVCodecContext :: struct {
 	pix_fmt:             Pixel_Format,
 }
 
-// FFmpeg 7.1 prefix through time_base. Never size_of() this.
+// FFmpeg 8.x prefix through buf[] (offset 176 on x64). Never size_of() this.
 AVFrame :: struct {
 	data:                [AV_NUM_DATA_POINTERS][^]u8,
 	linesize:            [AV_NUM_DATA_POINTERS]i32,
@@ -113,6 +117,11 @@ AVFrame :: struct {
 	pts:                 i64,
 	pkt_dts:             i64,
 	time_base:           AVRational,
+	quality:             i32,
+	opaque:              rawptr,
+	repeat_pict:         i32,
+	sample_rate:         i32,
+	buf:                 [AV_NUM_DATA_POINTERS]^AVBuffer_Ref,
 }
 
 // Full FFmpeg 7.1 AVPacket ABI.

@@ -26,6 +26,8 @@ Session :: struct {
 	cfg:      utils.Config,
 	cap:      core.Capture,
 	enc:      core.Encoder,
+	enc_hw:   core.Encoder_HW,
+	use_gpu:  bool,
 	viewers:  [dynamic]^Viewer,
 	mu:       sync.RW_Mutex,
 	start_mu: sync.Mutex,
@@ -54,7 +56,7 @@ session_start :: proc(s: ^Session, cfg: utils.Config) -> bool {
 		thread.destroy(leftover)
 	}
 
-	cap, cerr := core.capture_open(cfg.monitor, cfg.cursor)
+	cap, cerr := core.capture_open(cfg.monitor, cfg.cursor, true)
 	if cerr != .None {
 		fmt.eprintln("capture_open:", cerr)
 		return false
@@ -64,23 +66,65 @@ session_start :: proc(s: ^Session, cfg: utils.Config) -> bool {
 	if enc_cfg.width <= 0 { enc_cfg.width = cap.width }
 	if enc_cfg.height <= 0 { enc_cfg.height = cap.height }
 
-	enc, eerr := core.encoder_open(enc_cfg)
-	if eerr != .None {
-		fmt.eprintln("encoder_open:", eerr)
-		core.capture_close(&cap)
-		return false
+	use_gpu := false
+	enc_hw: core.Encoder_HW
+	enc: core.Encoder
+	hw_err: core.Encoder_Error
+
+	if core.capture_uses_gpu(&cap) {
+		if dev, imm, ok := core.capture_d3d11(&cap); ok {
+			gpu_cfg := enc_cfg
+			// Zero-copy requires encoder pool size to match the GPU capture texture.
+			if gpu_cfg.width != cap.width || gpu_cfg.height != cap.height {
+				fmt.printf("D3D11 encode at native %dx%d (config %dx%d needs CPU scale)\n",
+					cap.width, cap.height, enc_cfg.width, enc_cfg.height)
+				gpu_cfg.width = cap.width
+				gpu_cfg.height = cap.height
+			}
+			// Must use `=`: `:=` would shadow enc_hw and leave s.enc_hw zeroed (nil ctx).
+			enc_hw, hw_err = core.encoder_open_d3d11(gpu_cfg, dev, imm)
+			if hw_err == .None {
+				use_gpu = true
+				enc = enc_hw.base
+				enc_cfg.width = int(enc.width)
+				enc_cfg.height = int(enc.height)
+			} else {
+				fmt.eprintln("encoder_open_d3d11:", hw_err, "(falling back to CPU capture+encode)")
+				core.capture_close(&cap)
+				cap, cerr = core.capture_open(cfg.monitor, cfg.cursor, false)
+				if cerr != .None {
+					fmt.eprintln("capture_open (CPU fallback):", cerr)
+					return false
+				}
+			}
+		}
+	}
+	if !use_gpu {
+		enc, hw_err = core.encoder_open(enc_cfg)
+		if hw_err != .None {
+			fmt.eprintln("encoder_open:", hw_err)
+			core.capture_close(&cap)
+			return false
+		}
 	}
 
 	sync.lock(&s.mu)
 	s.cfg = enc_cfg
 	s.cap = cap
 	s.enc = enc
+	s.enc_hw = enc_hw
+	s.use_gpu = use_gpu
 	s.running = true
 	s.started = time.tick_now()
 	s.key_armed = false
 	s.loop = thread.create_and_start_with_poly_data(s, session_loop)
 	sync.unlock(&s.mu)
-	fmt.printf("capture+encode started (%dx%d %s)\n", cap.width, cap.height, enc.name)
+	if use_gpu {
+		fmt.printf("capture+encode started (%dx%d %s, D3D11 zero-copy) plid=%s\n",
+			cap.width, cap.height, enc.name, enc.profile_level_id)
+	} else {
+		fmt.printf("capture+encode started (%dx%d %s)\n", cap.width, cap.height, enc.name)
+	}
 	return true
 }
 
@@ -109,9 +153,21 @@ session_stop :: proc(s: ^Session) {
 
 session_h264_profile :: proc(s: ^Session) -> string {
 	sync.shared_lock(&s.mu)
-	h := s.enc.headers
-	sync.shared_unlock(&s.mu)
-	return core.h264_webrtc_profile(h)
+	defer sync.shared_unlock(&s.mu)
+	w := s.enc.width
+	h := s.enc.height
+	hdr := s.enc.headers
+	fps := i32(s.cfg.fps)
+	if s.use_gpu {
+		w = s.enc_hw.base.width
+		h = s.enc_hw.base.height
+		hdr = s.enc_hw.base.headers
+	}
+	if fps <= 0 {
+		fps = 30
+	}
+	plid := core.h264_profile_level_id(w, h, fps)
+	return core.h264_webrtc_profile(hdr, plid)
 }
 
 session_viewer_count :: proc(s: ^Session) -> int {
@@ -224,6 +280,7 @@ session_remove_viewer :: proc(s: ^Session, sock: net.TCP_Socket) -> (remaining: 
 session_request_keyframe :: proc(s: ^Session) {
 	sync.lock(&s.mu)
 	running := s.running
+	use_gpu := s.use_gpu
 	if running && s.key_armed && time.tick_since(s.last_key) < 500 * time.Millisecond {
 		sync.unlock(&s.mu)
 		return
@@ -233,7 +290,12 @@ session_request_keyframe :: proc(s: ^Session) {
 		s.key_armed = true
 	}
 	sync.unlock(&s.mu)
-	if running {
+	if !running {
+		return
+	}
+	if use_gpu {
+		core.encoder_hw_request_keyframe(&s.enc_hw)
+	} else {
 		core.encoder_request_keyframe(&s.enc)
 	}
 }
@@ -280,13 +342,41 @@ session_loop :: proc(s: ^Session) {
 	defer delete(packets)
 	frame: core.Frame
 
+	fps := s.cfg.fps
+	if fps <= 0 {
+		fps = 30
+	}
+	frame_ns := i64(1_000_000_000) / i64(fps)
+	next_frame_ns := time.to_unix_nanoseconds(time.now())
+
 	for {
 		sync.shared_lock(&s.mu)
 		running := s.running
+		use_gpu := s.use_gpu
 		sync.shared_unlock(&s.mu)
 		if !running {
 			break
 		}
+
+		now_ns := time.to_unix_nanoseconds(time.now())
+
+		// Drop when more than three frame periods behind (avoid starving the encoder).
+		if now_ns > next_frame_ns + 3 * frame_ns {
+			skip := (now_ns - next_frame_ns) / frame_ns
+			next_frame_ns += skip * frame_ns
+			continue
+		}
+
+		if now_ns + 500_000 < next_frame_ns {
+			remaining := next_frame_ns - now_ns
+			if remaining > 2_000_000 {
+				time.sleep(time.Duration(remaining - 1_000_000))
+			} else {
+				time.sleep(500 * time.Microsecond)
+			}
+			continue
+		}
+		next_frame_ns += frame_ns
 
 		cerr := core.capture_frame(&s.cap, &frame)
 		if cerr == .Timeout {
@@ -295,12 +385,14 @@ session_loop :: proc(s: ^Session) {
 		if cerr == .Device_Lost {
 			fmt.eprintln("DXGI duplication lost; recreating")
 			core.capture_close(&s.cap)
-			cap, err := core.capture_open(s.cfg.monitor, s.cfg.cursor)
+			cap, err := core.capture_open(s.cfg.monitor, s.cfg.cursor, use_gpu)
 			if err != .None {
 				fmt.eprintln("capture recreate failed:", err)
 				break
 			}
+			sync.lock(&s.mu)
 			s.cap = cap
+			sync.unlock(&s.mu)
 			continue
 		}
 		if cerr != .None {
@@ -309,14 +401,24 @@ session_loop :: proc(s: ^Session) {
 		}
 
 		clear(&packets)
-		if core.encoder_encode_bgra(&s.enc, frame.data, frame.width, frame.height, frame.stride, &packets) != .None {
+		encode_err: core.Encoder_Error
+		if use_gpu && frame.gpu && frame.texture != nil {
+			encode_err = core.encoder_encode_d3d11(&s.enc_hw, frame.texture, &packets)
+		} else if len(frame.data) > 0 {
+			encode_err = core.encoder_encode_bgra(&s.enc, frame.data, frame.width, frame.height, frame.stride, &packets)
+		} else {
+			continue
+		}
+		if encode_err != .None {
+			if use_gpu {
+				fmt.eprintf("d3d11 encode: %v\n", encode_err)
+			}
+			continue
+		}
+		if len(packets) == 0 {
 			continue
 		}
 
-		fps := s.cfg.fps
-		if fps <= 0 {
-			fps = 30
-		}
 		if sync.shared_guard(&s.mu) {
 			for v in s.viewers {
 				if v.peer == nil {
@@ -336,7 +438,14 @@ session_loop :: proc(s: ^Session) {
 		}
 	}
 
-	core.encoder_close(&s.enc)
+	sync.lock(&s.mu)
+	use_gpu := s.use_gpu
+	sync.unlock(&s.mu)
+	if use_gpu {
+		core.encoder_hw_close(&s.enc_hw)
+	} else {
+		core.encoder_close(&s.enc)
+	}
 	core.capture_close(&s.cap)
 	fmt.println("capture+encode stopped")
 }

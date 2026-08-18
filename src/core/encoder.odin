@@ -21,9 +21,10 @@ Encoder :: struct {
 	src_h:     i32,
 	pix_fmt:   ffmpeg.Pixel_Format,
 	pts:       i64,
-	name:      string,
-	force_key:  bool,
-	headers:    []byte, // AVCC SPS/PPS copied from extradata or the first IDR
+	name:              string,
+	force_key:         bool,
+	headers:           []byte, // AVCC SPS/PPS copied from extradata or the first IDR
+	profile_level_id:  string, // WebRTC fmtp, e.g. 42e029 for 4.1, 42e032 for 5.0
 }
 
 Encoded_AU :: struct {
@@ -156,8 +157,51 @@ encoder_open :: proc(cfg: utils.Config) -> (enc: Encoder, err: Encoder_Error) {
 		pix_fmt  = ffmpeg.PIX_FMT_YUV420P,
 		name     = string(name),
 		headers  = headers,
+		profile_level_id = h264_profile_level_id(w, h, fps),
 	}
 	return enc, .None
+}
+
+// Pick the lowest H.264 level that fits resolution and frame rate (ITU-T H.264 Table A-1).
+@(private)
+h264_pick_level :: proc(w, h, fps: i32) -> cstring {
+	rate := fps
+	if rate <= 0 {
+		rate = 30
+	}
+	mb_w := (w + 15) / 16
+	mb_h := (h + 15) / 16
+	mb := i64(mb_w) * i64(mb_h)
+	mbps := mb * i64(rate)
+
+	// MaxFS, MaxMBPS per level.
+	if mb <= 8192 && mbps <= 245760 {
+		return "4.1"
+	}
+	if mb <= 22080 && mbps <= 589824 {
+		return "5.0"
+	}
+	if mb <= 36864 && mbps <= 983040 {
+		return "5.1"
+	}
+	return "5.2"
+}
+
+// Constrained-baseline profile-level-id for WebRTC fmtp (42e0 + level_idc hex).
+h264_profile_level_id :: proc(w, h, fps: i32) -> string {
+	level := h264_pick_level(w, h, fps)
+	level_idc: u8 = 31
+	switch level {
+	case "4.1":
+		level_idc = 41
+	case "5.0":
+		level_idc = 50
+	case "5.1":
+		level_idc = 51
+	case "5.2":
+		level_idc = 52
+	}
+	return fmt.tprintf("42e0%02x", level_idc)
 }
 
 @(private)
@@ -174,7 +218,8 @@ apply_encoder_options :: proc(ctx: ^ffmpeg.AVCodecContext, name: cstring, fps: i
 	ffmpeg.av_opt_set_int(ctx, "bf", 0, child)
 	ffmpeg.av_opt_set_int(ctx, "profile", 578, 0) // constrained baseline
 	ffmpeg.av_opt_set(ctx, "profile", "baseline", child)
-	ffmpeg.av_opt_set(ctx, "level", "4.1", child)
+	level := h264_pick_level(ctx.width, ctx.height, fps)
+	ffmpeg.av_opt_set(ctx, "level", level, child)
 	// Length-prefixed NALs so RTP packetization does not scan 00 00 01 inside slices.
 	ffmpeg.av_opt_set(ctx, "annexb", "0", child)
 	ffmpeg.av_opt_set(ctx, "aud", "0", child)
@@ -241,6 +286,9 @@ encoder_encode_bgra :: proc(enc: ^Encoder, bgra: []byte, src_w, src_h, stride: i
 	if enc.ctx == nil || enc.frame == nil {
 		return .Alloc_Failed
 	}
+	if len(bgra) == 0 {
+		return .Scale_Failed
+	}
 
 	src_w_i := i32(src_w if src_w > 0 else int(enc.width))
 	src_h_i := i32(src_h if src_h > 0 else int(enc.height))
@@ -287,6 +335,11 @@ encoder_encode_bgra :: proc(enc: ^Encoder, bgra: []byte, src_w, src_h, stride: i
 		return .Send_Failed
 	}
 
+	return drain_encoder_packets(enc, packets)
+}
+
+@(private)
+drain_encoder_packets :: proc(enc: ^Encoder, packets: ^[dynamic]Encoded_AU) -> Encoder_Error {
 	merged: [dynamic]byte
 	defer delete(merged)
 	is_key := false
@@ -434,8 +487,9 @@ h264_avcc_prepare_for_webrtc :: proc(src: []byte, is_keyframe: bool) -> []byte {
 }
 
 // WebRTC fmtp line including optional sprop-parameter-sets from cached SPS/PPS.
-h264_webrtc_profile :: proc(headers: []byte) -> string {
-	base := "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
+h264_webrtc_profile :: proc(headers: []byte, profile_level_id: string = "42e01f") -> string {
+	plid := profile_level_id if profile_level_id != "" else "42e01f"
+	base := fmt.tprintf("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=%s", plid)
 	if sprop := h264_sprop_parameter_sets(headers); sprop != "" {
 		return fmt.tprintf("%s;sprop-parameter-sets=%s", base, sprop)
 	}

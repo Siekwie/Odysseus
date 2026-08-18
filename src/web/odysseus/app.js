@@ -74,6 +74,20 @@ async function playVideo() {
   }
 }
 
+function applyLowLatency(receiver, track) {
+  try {
+    if (receiver && "playoutDelayHint" in receiver) {
+      receiver.playoutDelayHint = 0;
+    }
+    if (track && "playoutDelayHint" in track) {
+      track.playoutDelayHint = 0;
+    }
+  } catch (_) {
+    // optional API; ignore if unsupported
+  }
+  videoEl.disableRemotePlayback = true;
+}
+
 function browserHasH264() {
   if (!RTCRtpReceiver.getCapabilities) {
     return true;
@@ -131,6 +145,7 @@ async function start() {
       videoEl.srcObject = stream;
       hasTrack = true;
       setStatus("Streaming");
+      applyLowLatency(event.receiver, event.track);
       playVideo();
       startStats(pc);
       send({ type: "viewer-ready" });
