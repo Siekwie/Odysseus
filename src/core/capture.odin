@@ -71,3 +71,18 @@ capture_d3d11 :: proc(cap: ^Capture) -> (device: ^d3d11.IDevice, imm: ^d3d11.IDe
 capture_uses_gpu :: proc(cap: ^Capture) -> bool {
 	return cap.gpu
 }
+
+// True when DXGI capture can feed h264_nvenc through D3D11 textures (NVIDIA adapter only).
+capture_d3d11_nvenc_ok :: proc(cap: ^Capture) -> bool {
+	when ODIN_OS == .Windows {
+		return capture_d3d11_nvenc_ok_dxgi(cap)
+	}
+	return false
+}
+
+capture_adapter_vendor :: proc(cap: ^Capture) -> u32 {
+	when ODIN_OS == .Windows {
+		return capture_adapter_vendor_dxgi(cap)
+	}
+	return 0
+}

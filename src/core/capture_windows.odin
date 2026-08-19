@@ -7,9 +7,15 @@ import "core:time"
 
 CURSOR_SHOWING :: 0x00000001
 
+// DXGI adapter vendor IDs (DXGI_ADAPTER_DESC.VendorId).
+GPU_VENDOR_NVIDIA :: u32(0x10DE)
+GPU_VENDOR_INTEL  :: u32(0x8086)
+GPU_VENDOR_AMD    :: u32(0x1002)
+
 Capture_DXGI :: struct {
 	device:      ^d3d11.IDevice,
 	immediate:   ^d3d11.IDeviceContext,
+	adapter_vendor: u32,
 	duplication: ^dxgi.IOutputDuplication,
 	staging:     ^d3d11.ITexture2D,
 	frame_tex:   ^d3d11.ITexture2D,
@@ -53,6 +59,9 @@ capture_open_dxgi :: proc(monitor: int, draw_cursor := true, prefer_gpu := true)
 
 	od: dxgi.OUTPUT_DESC
 	output->GetDesc(&od)
+
+	adapter_desc: dxgi.ADAPTER_DESC
+	adapter->GetDesc(&adapter_desc)
 
 	device: ^d3d11.IDevice
 	immediate: ^d3d11.IDeviceContext
@@ -155,6 +164,7 @@ capture_open_dxgi :: proc(monitor: int, draw_cursor := true, prefer_gpu := true)
 	impl := new(Capture_DXGI)
 	impl.device = device
 	impl.immediate = immediate
+	impl.adapter_vendor = adapter_desc.VendorId
 	impl.duplication = duplication
 	impl.staging = staging
 	impl.frame_tex = frame_tex
@@ -197,6 +207,23 @@ capture_d3d11_dxgi :: proc(cap: ^Capture) -> (device: ^d3d11.IDevice, imm: ^d3d1
 	}
 	impl := (^Capture_DXGI)(cap.impl)
 	return impl.device, impl.immediate, true
+}
+
+// D3D11 -> h264_nvenc zero-copy requires the capture adapter to be NVIDIA.
+capture_d3d11_nvenc_ok_dxgi :: proc(cap: ^Capture) -> bool {
+	if cap.impl == nil || !cap.gpu {
+		return false
+	}
+	impl := (^Capture_DXGI)(cap.impl)
+	return impl.adapter_vendor == GPU_VENDOR_NVIDIA
+}
+
+capture_adapter_vendor_dxgi :: proc(cap: ^Capture) -> u32 {
+	if cap.impl == nil {
+		return 0
+	}
+	impl := (^Capture_DXGI)(cap.impl)
+	return impl.adapter_vendor
 }
 
 capture_frame_dxgi :: proc(cap: ^Capture, out: ^Frame) -> Capture_Error {

@@ -71,12 +71,12 @@ session_start :: proc(s: ^Session, cfg: utils.Config) -> bool {
 	enc: core.Encoder
 	hw_err: core.Encoder_Error
 
-	if core.capture_uses_gpu(&cap) {
+	if core.capture_uses_gpu(&cap) && core.capture_d3d11_nvenc_ok(&cap) {
 		if dev, imm, ok := core.capture_d3d11(&cap); ok {
 			gpu_cfg := enc_cfg
 			// Zero-copy requires encoder pool size to match the GPU capture texture.
 			if gpu_cfg.width != cap.width || gpu_cfg.height != cap.height {
-				fmt.printf("D3D11 encode at native %dx%d (config %dx%d needs CPU scale)\n",
+				fmt.printf("D3D11 encode at native %dx%d (config %dx%d needs GPU scale; not implemented yet)\n",
 					cap.width, cap.height, enc_cfg.width, enc_cfg.height)
 				gpu_cfg.width = cap.width
 				gpu_cfg.height = cap.height
@@ -97,6 +97,22 @@ session_start :: proc(s: ^Session, cfg: utils.Config) -> bool {
 					return false
 				}
 			}
+		}
+	} else if core.capture_uses_gpu(&cap) {
+		vendor := core.capture_adapter_vendor(&cap)
+		switch vendor {
+		case core.GPU_VENDOR_INTEL:
+			fmt.println("D3D11 zero-copy NVENC skipped (monitor on Intel GPU; using CPU capture + NVENC on NVIDIA)")
+		case core.GPU_VENDOR_AMD:
+			fmt.println("D3D11 zero-copy NVENC skipped (monitor on AMD GPU; using CPU capture + NVENC on NVIDIA)")
+		case:
+			fmt.printf("D3D11 zero-copy NVENC skipped (capture adapter vendor 0x%04x; using CPU capture+encode)\n", vendor)
+		}
+		core.capture_close(&cap)
+		cap, cerr = core.capture_open(cfg.monitor, cfg.cursor, false)
+		if cerr != .None {
+			fmt.eprintln("capture_open (CPU fallback):", cerr)
+			return false
 		}
 	}
 	if !use_gpu {
@@ -120,10 +136,14 @@ session_start :: proc(s: ^Session, cfg: utils.Config) -> bool {
 	s.loop = thread.create_and_start_with_poly_data(s, session_loop)
 	sync.unlock(&s.mu)
 	if use_gpu {
-		fmt.printf("capture+encode started (%dx%d %s, D3D11 zero-copy) plid=%s\n",
-			cap.width, cap.height, enc.name, enc.profile_level_id)
+		fmt.printf("capture+encode started (capture %dx%d, encode %dx%d %s, D3D11 zero-copy) plid=%s\n",
+			cap.width, cap.height, enc.width, enc.height, enc.name, enc.profile_level_id)
+	} else if enc.width != i32(cap.width) || enc.height != i32(cap.height) {
+		fmt.printf("capture+encode started (capture %dx%d, encode %dx%d %s) plid=%s\n",
+			cap.width, cap.height, enc.width, enc.height, enc.name, enc.profile_level_id)
 	} else {
-		fmt.printf("capture+encode started (%dx%d %s)\n", cap.width, cap.height, enc.name)
+		fmt.printf("capture+encode started (%dx%d %s) plid=%s\n",
+			cap.width, cap.height, enc.name, enc.profile_level_id)
 	}
 	return true
 }
