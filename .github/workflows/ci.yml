@@ -89,7 +89,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
-        run: brew install odin ffmpeg libdatachannel pkg-config
+        run: brew install odin ffmpeg pkg-config cmake openssl@3
+      - name: Cache libdatachannel
+        id: ldc
+        uses: actions/cache@v4
+        with:
+          path: vendor/libdatachannel/lib
+          key: libdatachannel-v0.24.5-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/fetch-libs.sh') }}
+      - name: Build libdatachannel
+        if: steps.ldc.outputs.cache-hit != 'true'
+        run: bash scripts/fetch-libs.sh
       - name: Build
         run: ./build.sh
       - name: Unit tests

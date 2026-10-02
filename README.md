@@ -89,7 +89,8 @@ dialog again for 30 seconds.
 ### macOS
 
 ```bash
-brew install odin ffmpeg libdatachannel pkg-config
+brew install odin ffmpeg pkg-config cmake openssl@3
+./scripts/fetch-libs.sh        # builds libdatachannel (Homebrew has no formula for it)
 ./build.sh
 ./build/odysseus
 ```

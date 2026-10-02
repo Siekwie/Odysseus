@@ -6,7 +6,8 @@
 # FFmpeg is not built here: install your distribution's FFmpeg development
 # packages (or `brew install ffmpeg`).
 #
-# Needs: git, cmake, a C++17 compiler, OpenSSL development files.
+# Needs: git, cmake, a C++17 compiler, OpenSSL development files
+# (macOS: `brew install cmake openssl@3`).
 set -euo pipefail
 
 version="${LIBDATACHANNEL_VERSION:-v0.24.5}"
@@ -20,8 +21,15 @@ if [ ! -f "$src/CMakeLists.txt" ]; then
 	git clone --depth 1 --branch "$version" --recursive https://github.com/paullouisageneau/libdatachannel.git "$src"
 fi
 
+cmake_args=()
+if [ "$(uname -s)" = Darwin ] && command -v brew >/dev/null 2>&1; then
+	# Homebrew's OpenSSL is keg-only; CMake does not find it by itself.
+	openssl_dir="$(brew --prefix openssl@3 2>/dev/null || true)"
+	[ -d "$openssl_dir" ] && cmake_args+=("-DOPENSSL_ROOT_DIR=$openssl_dir")
+fi
+
 echo "Building libdatachannel..."
-cmake -S "$src" -B "$build" \
+cmake -S "$src" -B "$build" ${cmake_args[@]+"${cmake_args[@]}"} \
 	-DCMAKE_BUILD_TYPE=Release \
 	-DBUILD_SHARED_LIBS=ON \
 	-DUSE_GNUTLS=OFF -DUSE_NICE=OFF \
@@ -32,5 +40,9 @@ cmake --build "$build" --config Release -j "$(getconf _NPROCESSORS_ONLN 2>/dev/n
 mkdir -p "$lib"
 # Copy the library together with its version symlinks.
 find "$build" -maxdepth 1 \( -name 'libdatachannel.so*' -o -name 'libdatachannel*.dylib' \) -exec cp -a {} "$lib/" \;
-ls "$lib"/libdatachannel.so* "$lib"/libdatachannel*.dylib 2>/dev/null || { echo "no library produced" >&2; exit 1; }
+found=0
+for f in "$lib"/libdatachannel.so* "$lib"/libdatachannel*.dylib; do
+	[ -e "$f" ] && { echo "$f"; found=1; }
+done
+[ "$found" = 1 ] || { echo "no library produced" >&2; exit 1; }
 echo "libdatachannel is in vendor/libdatachannel/lib"

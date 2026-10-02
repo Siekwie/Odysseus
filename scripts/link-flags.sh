@@ -13,12 +13,15 @@ if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists $ffmpeg_modules;
 fi
 
 # libdatachannel: a copy built by scripts/fetch-libs.sh wins over the system one.
-if ls "$root"/vendor/libdatachannel/lib/libdatachannel.so* "$root"/vendor/libdatachannel/lib/libdatachannel*.dylib >/dev/null 2>&1; then
+vendored=0
+for f in "$root"/vendor/libdatachannel/lib/libdatachannel.so* "$root"/vendor/libdatachannel/lib/libdatachannel*.dylib; do
+	[ -e "$f" ] && vendored=1
+done
+if [ "$vendored" = 1 ]; then
 	flags="$flags -L$root/vendor/libdatachannel/lib -Wl,-rpath,$root/vendor/libdatachannel/lib"
 elif command -v pkg-config >/dev/null 2>&1 && pkg-config --exists libdatachannel 2>/dev/null; then
 	flags="$flags $(pkg-config --libs-only-L libdatachannel)"
 elif [ "$(uname -s)" = Darwin ] && command -v brew >/dev/null 2>&1; then
-	# Homebrew's libdatachannel ships no .pc file.
 	flags="$flags -L$(brew --prefix)/lib"
 fi
 
