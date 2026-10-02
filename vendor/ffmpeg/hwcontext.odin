@@ -1,7 +1,9 @@
 package ffmpeg
 
-// Hardware context structs, used by the D3D11 zero-copy path on Windows.
-// Layouts match libavutil/hwcontext.h and hwcontext_d3d11va.h (FFmpeg 6-8).
+// Hardware context structs, used by the D3D11 zero-copy path on Windows and
+// by encoders fed through a hardware frame pool (VAAPI). Layouts match
+// libavutil/hwcontext.h and hwcontext_d3d11va.h of FFmpeg 8 and 9; callers
+// check codec_hw_frames_supported() before touching them.
 
 AVHWDeviceContext :: struct {
 	av_class:    rawptr,

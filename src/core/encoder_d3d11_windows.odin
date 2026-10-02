@@ -250,5 +250,5 @@ encoder_encode_d3d11 :: proc(enc: ^Encoder, src: ^Frame, out: ^[dynamic]Encoded_
 		)
 	}
 
-	return encoder_submit(enc, out)
+	return encoder_submit(enc, enc.frame, out)
 }

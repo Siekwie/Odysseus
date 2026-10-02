@@ -1,5 +1,6 @@
 package core
 
+import "core:os"
 import "core:strings"
 import "core:sync"
 
@@ -47,6 +48,12 @@ Encoder :: struct {
 	headers:      []byte, // AVCC SPS/PPS from the first keyframe
 	merged:       [dynamic]byte,
 
+	// Upload path (VAAPI): frames are converted on the CPU into `frame`, then
+	// copied to a surface of this pool, which is what the codec reads.
+	upload_device: ^ffmpeg.AVBuffer_Ref,
+	upload_frames: ^ffmpeg.AVBuffer_Ref,
+	upload_frame:  ^ffmpeg.AVFrame,
+
 	// GPU input path (Windows D3D11), nil for CPU-fed encoders.
 	hw:        rawptr,
 	hw_encode: proc(enc: ^Encoder, src: ^Frame, out: ^[dynamic]Encoded_AU) -> Encoder_Error,
@@ -65,7 +72,7 @@ when ODIN_OS == .Windows {
 } else when ODIN_OS == .Darwin {
 	AUTO_ENCODERS := [?]string{"h264_videotoolbox", "libx264", "libopenh264"}
 } else {
-	AUTO_ENCODERS := [?]string{"h264_nvenc", "h264_qsv", "libx264", "libopenh264", "h264_v4l2m2m"}
+	AUTO_ENCODERS := [?]string{"h264_nvenc", "h264_vaapi", "h264_qsv", "libx264", "libopenh264", "h264_v4l2m2m"}
 }
 
 encoder_is_auto :: proc(requested: string) -> bool {
@@ -111,7 +118,7 @@ encoder_open_best :: proc(requested: string, opts: Encoder_Options, skip: []stri
 		if enc, err = encoder_open(requested, opts); err == .None {
 			return
 		}
-		utils.log_debug("encoder %s: %v", requested, err)
+		utils.log_warn("encoder %s is not usable here (%v); picking one automatically", requested, err)
 	}
 	for name in AUTO_ENCODERS {
 		if name == requested || skipped(name, skip) {
@@ -176,7 +183,17 @@ encoder_open :: proc(name: string, opts: Encoder_Options) -> (enc: ^Encoder, err
 	if e.ctx == nil {
 		return nil, .Alloc_Failed
 	}
-	if !encoder_configure(e.ctx, name, e.width, e.height, e.fps, opts.bitrate_kbps, input, true) {
+	codec_format := input
+	if spec, uploads := upload_spec_for(name); uploads {
+		if !encoder_setup_upload(e, spec) {
+			return nil, .Open_Failed
+		}
+		codec_format = ffmpeg.pix_fmt(spec.hw_format)
+	}
+	if !encoder_configure(e.ctx, name, e.width, e.height, e.fps, opts.bitrate_kbps, codec_format, true) {
+		return nil, .Open_Failed
+	}
+	if e.upload_frames != nil && !ffmpeg.codec_set_hw_frames_ctx(e.ctx, e.upload_frames) {
 		return nil, .Open_Failed
 	}
 	if rc := ffmpeg.avcodec_open2(e.ctx, codec, nil); rc < 0 {
@@ -216,6 +233,15 @@ encoder_close :: proc(enc: ^Encoder) {
 		ffmpeg.avcodec_free_context(&enc.ctx)
 	}
 	// After the codec context: it holds references into the hardware frame pool.
+	if enc.upload_frame != nil {
+		ffmpeg.av_frame_free(&enc.upload_frame)
+	}
+	if enc.upload_frames != nil {
+		ffmpeg.av_buffer_unref(&enc.upload_frames)
+	}
+	if enc.upload_device != nil {
+		ffmpeg.av_buffer_unref(&enc.upload_device)
+	}
 	if enc.hw_close != nil {
 		enc.hw_close(enc)
 	}
@@ -227,6 +253,63 @@ encoder_close :: proc(enc: ^Encoder) {
 // encoder_request_keyframe makes the next encoded frame an IDR. Safe from any thread.
 encoder_request_keyframe :: proc(enc: ^Encoder) {
 	sync.atomic_store(&enc.force_key, true)
+}
+
+// An encoder that only accepts frames from a hardware pool.
+@(private)
+Upload_Spec :: struct {
+	device:    ffmpeg.HW_Device_Type,
+	hw_format: cstring, // pixel format of the pool's surfaces
+}
+
+@(private)
+upload_spec_for :: proc(name: string) -> (spec: Upload_Spec, ok: bool) {
+	switch name {
+	case "h264_vaapi":
+		return {.Vaapi, "vaapi"}, true
+	case "h264_nvenc":
+		// NVENC takes CPU frames directly. Routing it through a CUDA pool is
+		// only a way to exercise the upload path on machines without VAAPI.
+		if os.get_env("ODYSSEUS_NVENC_UPLOAD", context.temp_allocator) == "1" {
+			return {.Cuda, "cuda"}, true
+		}
+	}
+	return {}, false
+}
+
+// Creates the hardware device and an NV12 surface pool of the encoder's size.
+@(private)
+encoder_setup_upload :: proc(e: ^Encoder, spec: Upload_Spec) -> bool {
+	// The frames context is filled in directly and attached through a known
+	// struct offset; both are only verified for some FFmpeg releases.
+	if !ffmpeg.codec_hw_frames_supported() {
+		return false
+	}
+	hw_format := ffmpeg.pix_fmt(spec.hw_format)
+	if hw_format == ffmpeg.PIX_FMT_NONE {
+		return false
+	}
+	if rc := ffmpeg.av_hwdevice_ctx_create(&e.upload_device, spec.device, nil, nil, 0); rc < 0 {
+		buf: [ffmpeg.AV_ERROR_MAX_STRING_SIZE]u8
+		utils.log_debug("%s: no %s device: %s", encoder_name(e), spec.hw_format, ffmpeg.error_string(rc, buf[:]))
+		return false
+	}
+	e.upload_frames = ffmpeg.av_hwframe_ctx_alloc(e.upload_device)
+	if e.upload_frames == nil {
+		return false
+	}
+	frames := (^ffmpeg.AVHWFramesContext)(e.upload_frames.data)
+	frames.format = hw_format
+	frames.sw_format = e.input_format
+	frames.width = i32(e.width)
+	frames.height = i32(e.height)
+	if rc := ffmpeg.av_hwframe_ctx_init(e.upload_frames); rc < 0 {
+		buf: [ffmpeg.AV_ERROR_MAX_STRING_SIZE]u8
+		utils.log_debug("%s: frame pool: %s", encoder_name(e), ffmpeg.error_string(rc, buf[:]))
+		return false
+	}
+	e.upload_frame = ffmpeg.av_frame_alloc()
+	return e.upload_frame != nil
 }
 
 // Software frame layout each encoder is fed with.
@@ -305,6 +388,9 @@ encoder_configure :: proc(
 		ffmpeg.av_opt_set(ctx, "profile", "constrained_baseline", child)
 		ffmpeg.av_opt_set(ctx, "rc", "cbr", child)
 		ffmpeg.av_opt_set(ctx, "header_insertion_mode", "idr", child)
+	case "h264_vaapi":
+		ffmpeg.av_opt_set(ctx, "rc_mode", "CBR", child)
+		ffmpeg.av_opt_set_int(ctx, "async_depth", 1, child)
 	case "h264_videotoolbox":
 		ffmpeg.av_opt_set(ctx, "realtime", "1", child)
 		ffmpeg.av_opt_set(ctx, "allow_sw", "1", child)
@@ -369,24 +455,36 @@ encoder_encode :: proc(enc: ^Encoder, src: ^Frame, out: ^[dynamic]Encoded_AU) ->
 	if scaled <= 0 {
 		return .Scale_Failed
 	}
-	return encoder_submit(enc, out)
+	if enc.upload_frame == nil {
+		return encoder_submit(enc, enc.frame, out)
+	}
+
+	// Copy the converted frame onto a surface from the pool.
+	ffmpeg.av_frame_unref(enc.upload_frame)
+	if ffmpeg.av_hwframe_get_buffer(enc.upload_frames, enc.upload_frame, 0) < 0 {
+		return .Alloc_Failed
+	}
+	if ffmpeg.av_hwframe_transfer_data(enc.upload_frame, enc.frame, 0) < 0 {
+		return .Send_Failed
+	}
+	return encoder_submit(enc, enc.upload_frame, out)
 }
 
-// Stamps enc.frame, sends it to the codec and collects the packets.
-encoder_submit :: proc(enc: ^Encoder, out: ^[dynamic]Encoded_AU) -> Encoder_Error {
-	ffmpeg.frame_set_pts(enc.frame, enc.pts)
+// Stamps frame, sends it to the codec and collects the packets.
+encoder_submit :: proc(enc: ^Encoder, frame: ^ffmpeg.AVFrame, out: ^[dynamic]Encoded_AU) -> Encoder_Error {
+	ffmpeg.frame_set_pts(frame, enc.pts)
 	enc.pts += 1
 
 	want_key := sync.atomic_load(&enc.force_key)
-	ffmpeg.frame_set_pict_type(enc.frame, ffmpeg.AV_PICTURE_TYPE_I if want_key else ffmpeg.AV_PICTURE_TYPE_NONE)
+	ffmpeg.frame_set_pict_type(frame, ffmpeg.AV_PICTURE_TYPE_I if want_key else ffmpeg.AV_PICTURE_TYPE_NONE)
 
-	send := ffmpeg.avcodec_send_frame(enc.ctx, enc.frame)
+	send := ffmpeg.avcodec_send_frame(enc.ctx, frame)
 	if ffmpeg.is_again(send) {
 		// Output queue is full: drain it, then the frame is accepted.
 		if err := encoder_drain(enc, out); err != .None {
 			return err
 		}
-		send = ffmpeg.avcodec_send_frame(enc.ctx, enc.frame)
+		send = ffmpeg.avcodec_send_frame(enc.ctx, frame)
 	}
 	if send < 0 {
 		buf: [ffmpeg.AV_ERROR_MAX_STRING_SIZE]u8

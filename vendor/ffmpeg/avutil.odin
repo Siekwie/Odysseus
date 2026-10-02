@@ -44,6 +44,8 @@ foreign avutil {
 	av_buffer_ref :: proc(buf: ^AVBuffer_Ref) -> ^AVBuffer_Ref ---
 	av_buffer_unref :: proc(buf: ^^AVBuffer_Ref) ---
 
+	av_hwdevice_ctx_create :: proc(device_ctx: ^^AVBuffer_Ref, type: HW_Device_Type, device: cstring, opts: ^AVDictionary, flags: i32) -> i32 ---
+	av_hwframe_transfer_data :: proc(dst, src: ^AVFrame, flags: i32) -> i32 ---
 	av_hwdevice_ctx_alloc :: proc(type: HW_Device_Type) -> ^AVBuffer_Ref ---
 	av_hwdevice_ctx_init :: proc(ref: ^AVBuffer_Ref) -> i32 ---
 	av_hwframe_ctx_alloc :: proc(device_ref: ^AVBuffer_Ref) -> ^AVBuffer_Ref ---

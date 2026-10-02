@@ -454,12 +454,14 @@ pipeline_open :: proc(s: ^Session, p: ^Pipeline) -> bool {
 	enc: ^core.Encoder
 	eerr := core.Encoder_Error.Codec_Not_Found
 	zero_copy := false
+	requested := cfg.encoder
 	if cap.gpu {
-		enc, eerr = core.encoder_open_zero_copy(cfg.encoder, &cap, enc_opts, p.bad[:])
-		if eerr != .None && !core.encoder_is_auto(cfg.encoder) && !core.encoder_exists_working(cfg.encoder, enc_opts, p.bad[:]) {
+		enc, eerr = core.encoder_open_zero_copy(requested, &cap, enc_opts, p.bad[:])
+		if eerr != .None && !core.encoder_is_auto(requested) && !core.encoder_exists_working(requested, enc_opts, p.bad[:]) {
 			// The requested encoder does not work at all: fall back to the automatic choice.
-			utils.log_warn("encoder %s is not usable here; picking one automatically", cfg.encoder)
-			enc, eerr = core.encoder_open_zero_copy("h264", &cap, enc_opts, p.bad[:])
+			utils.log_warn("encoder %s is not usable here; picking one automatically", requested)
+			requested = "h264"
+			enc, eerr = core.encoder_open_zero_copy(requested, &cap, enc_opts, p.bad[:])
 		}
 		zero_copy = eerr == .None
 		if !zero_copy {
@@ -474,7 +476,7 @@ pipeline_open :: proc(s: ^Session, p: ^Pipeline) -> bool {
 		}
 	}
 	if enc == nil {
-		enc, eerr = core.encoder_open_best(cfg.encoder, enc_opts, p.bad[:])
+		enc, eerr = core.encoder_open_best(requested, enc_opts, p.bad[:])
 	}
 	if eerr != .None {
 		utils.log_error("no usable H.264 encoder (%v); try -list-encoders", eerr)

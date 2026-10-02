@@ -18,7 +18,7 @@ devices that can reach each other on the same network connect directly.
 
 - Real-time desktop capture on Windows, Linux (X11 and Wayland) and macOS
 - H.264 over WebRTC, played by a plain `<video>` element with the browser's hardware decoder
-- Hardware encoding where it works (NVENC, AMF, Quick Sync, VideoToolbox, Media Foundation), software fallback (x264 / OpenH264); the first encoder that actually opens is used
+- Hardware encoding where it works (NVENC, AMF, Quick Sync, VAAPI, VideoToolbox, Media Foundation), software fallback (x264 / OpenH264); the first encoder that actually opens is used
 - Zero-copy capture → encode on Windows with NVENC (the frame never leaves the GPU; AMF uses the same path but has not been tested on AMD hardware)
 - System audio (what the speakers play) as stereo Opus
 - Mouse cursor in the stream
@@ -33,12 +33,14 @@ devices that can reach each other on the same network connect directly.
 | | Capture | Hardware encode | Audio | Remote control | Status |
 | --- | --- | --- | --- | --- | --- |
 | **Windows 10/11** | Desktop Duplication (DXGI), GDI fallback | NVENC, AMF, Quick Sync, Media Foundation | WASAPI loopback | `SendInput` | Tested end to end |
-| **Linux, X11** | FFmpeg `x11grab` | NVENC, Quick Sync | PulseAudio / PipeWire-Pulse monitor | XTest | Tested end to end |
-| **Linux, Wayland** | xdg-desktop-portal + PipeWire | NVENC, Quick Sync | PulseAudio / PipeWire-Pulse monitor | RemoteDesktop portal (GNOME, KDE) | Capture tested on wlroots (sway); portal input untested |
+| **Linux, X11** | FFmpeg `x11grab` | NVENC, VAAPI, Quick Sync | PulseAudio / PipeWire-Pulse monitor | XTest | Tested end to end |
+| **Linux, Wayland** | xdg-desktop-portal + PipeWire | NVENC, VAAPI, Quick Sync | PulseAudio / PipeWire-Pulse monitor | RemoteDesktop portal (GNOME, KDE) | Capture tested on wlroots (sway); portal input untested |
 | **macOS 12.3+** | AVFoundation (default), ScreenCaptureKit (`-capture:screencapturekit`) | VideoToolbox | ScreenCaptureKit system audio (macOS 13+) | CoreGraphics events | Builds in CI; not yet run on real hardware |
 
-VAAPI is not supported yet; Intel and AMD GPUs on Linux encode through Quick
-Sync where available and x264 otherwise.
+On Linux, Intel and AMD GPUs encode through VAAPI (needs FFmpeg 8 or 9 on
+x86-64). That path shares its code with a CUDA-pool variant that is tested,
+but it has not been run on VAAPI hardware; if it fails to open or to encode,
+Odysseus moves on to the next encoder by itself.
 
 ## Quick start
 

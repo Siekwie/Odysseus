@@ -170,7 +170,7 @@ handle_auth :: proc(client: ^server.Client, given: string) {
 
 	if !ok {
 		client.auth_failures += 1
-		utils.log_warn("failed auth attempt from %v", client.remote.address)
+		utils.log_warn("failed auth attempt from %s", net.address_to_string(client.remote.address, context.temp_allocator))
 		time.sleep(AUTH_FAILURE_DELAY) // slows guessing down
 		server.client_send_error(client, "auth", "wrong password")
 		if client.auth_failures >= AUTH_FAILURE_LIMIT {
