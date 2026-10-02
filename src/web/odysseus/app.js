@@ -373,13 +373,15 @@
     closeAuth();
   }
 
-  function onAuthError() {
+  function onAuthError(message) {
     // Whatever we sent last was wrong; forget it.
     const kind = state.auth.sent || (state.hello && !state.hello.authorized ? "password" : "pin");
     session.set(kind, null);
     state.auth.sent = null;
     state.auth.value = null;
-    showAuth(kind, AUTH_COPY[kind].wrong);
+    // The host locks an address out after repeated failures and says so.
+    const lockedOut = /too many/i.test(message || "");
+    showAuth(kind, lockedOut ? "Too many wrong attempts. Try again later." : AUTH_COPY[kind].wrong);
   }
 
   // The hello that follows an auth tells us it worked.
@@ -537,7 +539,7 @@
     const text = e.message ? e.message.charAt(0).toUpperCase() + e.message.slice(1) : "The host refused the request";
     switch (e.code) {
       case "auth":
-        onAuthError();
+        onAuthError(e.message);
         break;
       case "busy":
         scheduleReconnect("The host is at its viewer limit");
