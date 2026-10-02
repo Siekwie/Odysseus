@@ -18,8 +18,17 @@ Encoder_D3D11 :: struct {
 	d3d_context: ^d3d11.IDeviceContext,
 }
 
-// Encoders that can take the capture texture directly, best first.
-ZERO_COPY_ENCODERS := [?]string{"h264_nvenc", "h264_amf"}
+// The encoder that can take textures of the capture device directly: the
+// texture lives on the GPU that drives the monitor, so only that vendor's
+// encoder can read it. (Intel: Quick Sync needs its own frame type, not done.)
+@(private)
+zero_copy_encoder_for :: proc(vendor: u32) -> string {
+	switch vendor {
+	case GPU_VENDOR_NVIDIA: return "h264_nvenc"
+	case GPU_VENDOR_AMD:    return "h264_amf"
+	}
+	return ""
+}
 
 // encoder_open_zero_copy opens a GPU-fed encoder on the capture's D3D11 device.
 // The encoder runs at the capture size; scaling needs the CPU path.
@@ -39,26 +48,26 @@ encoder_open_zero_copy :: proc(requested: string, cap: ^Capture, opts: Encoder_O
 	}
 	defer ffmpeg.av_log_set_level(level)
 
-	err = .Codec_Not_Found
-	candidates: for name in ZERO_COPY_ENCODERS {
-		if !encoder_is_auto(requested) && requested != name {
-			continue
-		}
-		for s in skip {
-			if s == name {
-				continue candidates
-			}
-		}
-		e, open_err := encoder_open_d3d11(name, opts, device, imm)
-		if open_err == .None {
-			return e, .None
-		}
-		utils.log_debug("zero-copy %s: %v", name, open_err)
-		if open_err != .Codec_Not_Found {
-			err = open_err
+	name := zero_copy_encoder_for(capture_adapter_vendor(cap))
+	if name == "" {
+		// E.g. a laptop panel on the integrated GPU: frames go through system
+		// memory and can still be encoded by a discrete GPU's encoder.
+		utils.log_debug("zero-copy skipped: the monitor is on a GPU (vendor 0x%04x) without a texture-fed encoder", capture_adapter_vendor(cap))
+		return nil, .Codec_Not_Found
+	}
+	if !encoder_is_auto(requested) && requested != name {
+		return nil, .Codec_Not_Found
+	}
+	for s in skip {
+		if s == name {
+			return nil, .Codec_Not_Found
 		}
 	}
-	return nil, err
+	enc, err = encoder_open_d3d11(name, opts, device, imm)
+	if err != .None {
+		utils.log_debug("zero-copy %s: %v", name, err)
+	}
+	return
 }
 
 @(private)

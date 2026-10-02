@@ -14,9 +14,15 @@ import "../utils"
 CURSOR_SHOWING :: 0x00000001
 CURSOR_BOX_MAX :: 256
 
+// DXGI adapter vendor IDs (DXGI_ADAPTER_DESC.VendorId).
+GPU_VENDOR_NVIDIA :: u32(0x10DE)
+GPU_VENDOR_INTEL  :: u32(0x8086)
+GPU_VENDOR_AMD    :: u32(0x1002)
+
 Capture_DXGI :: struct {
 	device:      ^d3d11.IDevice,
 	immediate:   ^d3d11.IDeviceContext,
+	vendor:      u32, // GPU the captured monitor is attached to
 	duplication: ^dxgi.IOutputDuplication,
 	staging:     ^d3d11.ITexture2D, // CPU mode: readback target
 	frame_tex:   ^d3d11.ITexture2D, // GPU mode: desktop copy with the cursor drawn in
@@ -69,8 +75,11 @@ capture_open_dxgi :: proc(opts: Capture_Options) -> (cap: Capture, err: Capture_
 
 	od: dxgi.OUTPUT_DESC
 	output->GetDesc(&od)
+	adapter_desc: dxgi.ADAPTER_DESC
+	adapter->GetDesc(&adapter_desc)
 
 	impl := new(Capture_DXGI)
+	impl.vendor = adapter_desc.VendorId
 	ok := false
 	defer if !ok {
 		capture_dxgi_destroy(impl)
@@ -198,6 +207,16 @@ capture_dxgi_destroy :: proc(impl: ^Capture_DXGI) {
 capture_close_dxgi :: proc(cap: ^Capture) {
 	capture_dxgi_destroy((^Capture_DXGI)(cap.impl))
 	cap.impl = nil
+}
+
+// capture_adapter_vendor returns the vendor of the GPU driving the captured
+// monitor (GPU_VENDOR_*), 0 when unknown. On hybrid-graphics laptops this is
+// usually the integrated GPU even when a discrete one is present.
+capture_adapter_vendor :: proc(cap: ^Capture) -> u32 {
+	if cap.impl == nil || cap.backend != .DXGI {
+		return 0
+	}
+	return (^Capture_DXGI)(cap.impl).vendor
 }
 
 // capture_d3d11 exposes the capture's D3D11 device so an encoder can share it.
