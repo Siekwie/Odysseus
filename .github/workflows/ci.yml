@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ODIN_RELEASE: dev-2026-09
+
+jobs:
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: laytan/setup-odin@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          release: ${{ env.ODIN_RELEASE }}
+      - name: Build
+        run: .\build.ps1
+      - name: Unit tests
+        run: .\build.ps1 test
+      - name: Smoke test
+        run: |
+          .\build\odysseus.exe -version
+          .\build\odysseus.exe -list-encoders
+      - name: Type-check all targets
+        run: .\build.ps1 check
+
+  linux:
+    name: Linux (Ubuntu 24.04, FFmpeg 6)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang pkg-config cmake libssl-dev \
+            ffmpeg libavcodec-dev libavformat-dev libavdevice-dev libavutil-dev libswscale-dev \
+            libpipewire-0.3-dev libglib2.0-dev \
+            xvfb libx11-6 libxrandr2 libxtst6 \
+            pulseaudio pulseaudio-utils libpulse0
+      - uses: laytan/setup-odin@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          release: ${{ env.ODIN_RELEASE }}
+      - name: Cache libdatachannel
+        id: ldc
+        uses: actions/cache@v4
+        with:
+          path: vendor/libdatachannel/lib
+          key: libdatachannel-v0.24.5-ubuntu-24.04-${{ hashFiles('scripts/fetch-libs.sh') }}
+      - name: Build libdatachannel
+        if: steps.ldc.outputs.cache-hit != 'true'
+        run: bash scripts/fetch-libs.sh
+      - name: Build
+        run: ./build.sh
+      - name: Unit tests
+        run: ./build.sh test
+      - name: Smoke test
+        run: |
+          ./build/odysseus -version
+          ./build/odysseus -list-encoders
+      - name: End-to-end (X11 capture, software encode, headless Chrome)
+        env:
+          E2E_XVFB: "1"
+          E2E_BROWSER_ARGS: "--no-sandbox"
+        run: bash tests/e2e/run.sh -s 6 -- -audio:false
+      - name: End-to-end with audio (PulseAudio null sink)
+        env:
+          E2E_XVFB: "1"
+          E2E_BROWSER_ARGS: "--no-sandbox"
+        run: |
+          pulseaudio --start --exit-idle-time=-1
+          pactl load-module module-null-sink sink_name=ci
+          pactl set-default-sink ci
+          bash tests/e2e/run.sh -s 6 -a
+
+  macos:
+    name: macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: brew install odin ffmpeg libdatachannel pkg-config
+      - name: Build
+        run: ./build.sh
+      - name: Unit tests
+        run: ./build.sh test
+      - name: Smoke test
+        run: |
+          ./build/odysseus -version
+          ./build/odysseus -list-monitors
+          ./build/odysseus -list-encoders

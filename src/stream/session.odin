@@ -1,15 +1,19 @@
 package stream
 
-import "core:fmt"
-import "core:net"
 import "core:strings"
 import "core:sync"
 import "core:thread"
 import "core:time"
 
+import "../audio"
 import "../core"
 import "../network"
 import "../utils"
+
+// The streaming session: one capture + encode pipeline shared by every
+// viewer. It starts with the first viewer and stops when the last one leaves.
+// The pipeline lives entirely on the session thread; other threads only flip
+// flags (keyframe, monitor switch) and manage the viewer list.
 
 Pending_Ice :: struct {
 	candidate: string,
@@ -17,191 +21,210 @@ Pending_Ice :: struct {
 }
 
 Viewer :: struct {
-	sock:    net.TCP_Socket,
+	key:     rawptr, // signaling client that owns this viewer
 	peer:    ^network.Peer,
-	pending: [dynamic]Pending_Ice,
+	pending: [dynamic]Pending_Ice, // candidates that arrived before the offer
+}
+
+// Stream_Info describes what is currently being streamed.
+Stream_Info :: struct {
+	monitor: int,
+	width:   int, // encoded size
+	height:  int,
+	source_width:  int, // captured size
+	source_height: int,
+	fps:     int,
+	encoder: string, // static or session-owned; valid until the next pipeline restart
+	capture: string,
+	audio:   bool,
 }
 
 Session :: struct {
-	cfg:      utils.Config,
-	cap:      core.Capture,
-	enc:      core.Encoder,
-	enc_hw:   core.Encoder_HW,
-	use_gpu:  bool,
+	cfg:       utils.Config,
+	on_change: proc(user: rawptr), // stream info or viewer count changed; called without locks held
+	on_ended:  proc(user: rawptr), // the host refused or ended the share; called on the session thread as it exits
+	user:      rawptr,
+
+	mu:       sync.RW_Mutex, // viewers, info, headers, running, loop
 	viewers:  [dynamic]^Viewer,
-	mu:       sync.RW_Mutex,
-	start_mu: sync.Mutex,
 	running:  bool,
-	started:  time.Tick,
 	loop:     ^thread.Thread,
-	last_key: time.Tick,
-	key_armed: bool,
+	info:     Stream_Info,
+	enc_name: [32]u8,
+	headers:  []byte, // SPS/PPS of the running encoder, for the SDP fmtp
+
+	start_mu: sync.Mutex, // serializes session_start / session_stop
+	started:  sync.Sema,  // posted by the loop once the pipeline is open (or failed)
+	start_ok: bool,
+
+	monitor:    int,       // monitor the pipeline should capture
+	restart:    bool,      // atomic: reopen the pipeline
+	key_wanted: bool,      // atomic: next frame must be an IDR
+	last_key:   time.Tick, // PLI storm throttle, under mu
+	key_armed:  bool,
+
+	denied_until: i64, // now_ns clock; no new capture attempt before this (under mu)
+
+	start_ns: i64, // timestamp origin shared by audio and video
+	audio:    ^audio.Stream,
 }
 
-session_start :: proc(s: ^Session, cfg: utils.Config) -> bool {
+@(private)
+KEYFRAME_MIN_INTERVAL :: 500 * time.Millisecond
+
+// After the host refuses or ends a share, viewers cannot trigger another
+// request (and another dialog on the host's screen) for this long.
+@(private)
+DENIED_COOLDOWN :: 30 * time.Second
+
+Start_Result :: enum {
+	Ok,
+	Failed, // capture or encoder could not be opened
+	Denied, // the host refused or recently ended the share
+}
+
+session_init :: proc(
+	s: ^Session,
+	cfg: utils.Config,
+	on_change: proc(user: rawptr) = nil,
+	on_ended: proc(user: rawptr) = nil,
+	user: rawptr = nil,
+) {
+	s.cfg = cfg
+	s.monitor = cfg.monitor
+	s.info.monitor = cfg.monitor
+	s.on_change = on_change
+	s.on_ended = on_ended
+	s.user = user
+}
+
+// session_start makes sure the pipeline is running. It blocks until the
+// capture and encoder are open (which can include the host answering a
+// screen-share dialog).
+session_start :: proc(s: ^Session) -> Start_Result {
 	sync.lock(&s.start_mu)
 	defer sync.unlock(&s.start_mu)
 
 	sync.lock(&s.mu)
 	if s.running {
 		sync.unlock(&s.mu)
-		return true
+		return .Ok
+	}
+	if core.now_ns() < s.denied_until {
+		sync.unlock(&s.mu)
+		return .Denied
 	}
 	leftover := s.loop
 	s.loop = nil
 	sync.unlock(&s.mu)
-
 	if leftover != nil {
 		thread.join(leftover)
 		thread.destroy(leftover)
 	}
 
-	cap, cerr := core.capture_open(cfg.monitor, cfg.cursor, true)
-	if cerr != .None {
-		fmt.eprintln("capture_open:", cerr)
-		return false
-	}
-
-	enc_cfg := cfg
-	if enc_cfg.width <= 0 { enc_cfg.width = cap.width }
-	if enc_cfg.height <= 0 { enc_cfg.height = cap.height }
-
-	use_gpu := false
-	enc_hw: core.Encoder_HW
-	enc: core.Encoder
-	hw_err: core.Encoder_Error
-
-	if core.capture_uses_gpu(&cap) {
-		if dev, imm, ok := core.capture_d3d11(&cap); ok {
-			gpu_cfg := enc_cfg
-			// Zero-copy requires encoder pool size to match the GPU capture texture.
-			if gpu_cfg.width != cap.width || gpu_cfg.height != cap.height {
-				fmt.printf("D3D11 encode at native %dx%d (config %dx%d needs CPU scale)\n",
-					cap.width, cap.height, enc_cfg.width, enc_cfg.height)
-				gpu_cfg.width = cap.width
-				gpu_cfg.height = cap.height
-			}
-			// Must use `=`: `:=` would shadow enc_hw and leave s.enc_hw zeroed (nil ctx).
-			enc_hw, hw_err = core.encoder_open_d3d11(gpu_cfg, dev, imm)
-			if hw_err == .None {
-				use_gpu = true
-				enc = enc_hw.base
-				enc_cfg.width = int(enc.width)
-				enc_cfg.height = int(enc.height)
-			} else {
-				fmt.eprintln("encoder_open_d3d11:", hw_err, "(falling back to CPU capture+encode)")
-				core.capture_close(&cap)
-				cap, cerr = core.capture_open(cfg.monitor, cfg.cursor, false)
-				if cerr != .None {
-					fmt.eprintln("capture_open (CPU fallback):", cerr)
-					return false
-				}
-			}
-		}
-	}
-	if !use_gpu {
-		enc, hw_err = core.encoder_open(enc_cfg)
-		if hw_err != .None {
-			fmt.eprintln("encoder_open:", hw_err)
-			core.capture_close(&cap)
-			return false
-		}
-	}
-
 	sync.lock(&s.mu)
-	s.cfg = enc_cfg
-	s.cap = cap
-	s.enc = enc
-	s.enc_hw = enc_hw
-	s.use_gpu = use_gpu
 	s.running = true
-	s.started = time.tick_now()
+	s.start_ok = false
 	s.key_armed = false
+	s.start_ns = core.now_ns()
+	sync.atomic_store(&s.restart, false)
+	sync.atomic_store(&s.key_wanted, true)
 	s.loop = thread.create_and_start_with_poly_data(s, session_loop)
 	sync.unlock(&s.mu)
-	if use_gpu {
-		fmt.printf("capture+encode started (%dx%d %s, D3D11 zero-copy) plid=%s\n",
-			cap.width, cap.height, enc.name, enc.profile_level_id)
-	} else {
-		fmt.printf("capture+encode started (%dx%d %s)\n", cap.width, cap.height, enc.name)
+
+	sync.sema_wait(&s.started)
+	if !s.start_ok {
+		sync.lock(&s.mu)
+		failed := s.loop
+		s.loop = nil
+		s.running = false
+		denied := core.now_ns() < s.denied_until
+		sync.unlock(&s.mu)
+		if failed != nil {
+			thread.join(failed)
+			thread.destroy(failed)
+		}
+		return .Denied if denied else .Failed
 	}
-	return true
+
+	if s.cfg.audio {
+		s.audio = audio.start({device = s.cfg.audio_device, bitrate_kbps = s.cfg.audio_bitrate}, session_audio_packet, s)
+		sync.lock(&s.mu)
+		s.info.audio = s.audio != nil
+		sync.unlock(&s.mu)
+	}
+	return .Ok
 }
 
+// session_stop ends the pipeline and disconnects every viewer.
 session_stop :: proc(s: ^Session) {
 	sync.lock(&s.start_mu)
 	defer sync.unlock(&s.start_mu)
 
+	if s.audio != nil {
+		audio.stop(s.audio)
+		s.audio = nil
+	}
+
 	sync.lock(&s.mu)
 	s.running = false
-	leftover := s.loop
+	loop := s.loop
 	s.loop = nil
-	extras := s.viewers
+	viewers := s.viewers
 	s.viewers = {}
+	s.info.audio = false
 	sync.unlock(&s.mu)
 
-	for v in extras {
+	for v in viewers {
 		viewer_destroy(v)
 	}
-	delete(extras)
+	delete(viewers)
 
-	if leftover != nil {
-		thread.join(leftover)
-		thread.destroy(leftover)
+	if loop != nil {
+		thread.join(loop)
+		thread.destroy(loop)
 	}
 }
 
-session_h264_profile :: proc(s: ^Session) -> string {
+// session_audio_available reports whether viewers should be offered an audio track.
+session_audio_available :: proc(s: ^Session) -> bool {
 	sync.shared_lock(&s.mu)
 	defer sync.shared_unlock(&s.mu)
-	w := s.enc.width
-	h := s.enc.height
-	hdr := s.enc.headers
-	fps := i32(s.cfg.fps)
-	if s.use_gpu {
-		w = s.enc_hw.base.width
-		h = s.enc_hw.base.height
-		hdr = s.enc_hw.base.headers
-	}
-	if fps <= 0 {
-		fps = 30
-	}
-	plid := core.h264_profile_level_id(w, h, fps)
-	return core.h264_webrtc_profile(hdr, plid)
+	return s.info.audio
+}
+
+session_info :: proc(s: ^Session) -> Stream_Info {
+	sync.shared_lock(&s.mu)
+	defer sync.shared_unlock(&s.mu)
+	return s.info
+}
+
+// session_video_fmtp builds the H.264 fmtp of the SDP answer for the running encoder.
+session_video_fmtp :: proc(s: ^Session, allocator := context.allocator) -> string {
+	sync.shared_lock(&s.mu)
+	defer sync.shared_unlock(&s.mu)
+	return core.h264_fmtp(s.info.width, s.info.height, s.info.fps, s.headers, allocator)
 }
 
 session_viewer_count :: proc(s: ^Session) -> int {
 	sync.shared_lock(&s.mu)
-	n := len(s.viewers)
-	sync.shared_unlock(&s.mu)
-	return n
+	defer sync.shared_unlock(&s.mu)
+	return len(s.viewers)
 }
 
-session_has_viewer :: proc(s: ^Session, sock: net.TCP_Socket) -> bool {
+session_has_viewer :: proc(s: ^Session, key: rawptr) -> bool {
 	sync.shared_lock(&s.mu)
 	defer sync.shared_unlock(&s.mu)
-	return viewer_index(s, sock) >= 0
+	return viewer_index(s, key) >= 0
 }
 
-session_peer_for :: proc(s: ^Session, sock: net.TCP_Socket) -> ^network.Peer {
-	sync.shared_lock(&s.mu)
-	defer sync.shared_unlock(&s.mu)
-	i := viewer_index(s, sock)
-	if i < 0 {
-		return nil
-	}
-	return s.viewers[i].peer
-}
-
-// Attach peer to this signaling socket. Replaces a previous peer on the same
-// socket. Rejects a new socket when max_viewers > 0 and the list is full.
-session_attach_peer :: proc(s: ^Session, sock: net.TCP_Socket, peer: ^network.Peer, max_viewers: int) -> (pending: [dynamic]Pending_Ice, ok: bool) {
-	old: ^network.Peer
-
+// session_attach_peer binds a peer to its signaling client, replacing the
+// client's previous peer. A new client is refused once max_viewers is reached.
+// The caller owns the returned ICE candidates that were queued before the offer.
+session_attach_peer :: proc(s: ^Session, key: rawptr, peer: ^network.Peer, max_viewers: int) -> (pending: [dynamic]Pending_Ice, ok: bool) {
 	sync.lock(&s.mu)
-	i := viewer_index(s, sock)
 	v: ^Viewer
-	if i >= 0 {
+	if i := viewer_index(s, key); i >= 0 {
 		v = s.viewers[i]
 	} else {
 		if max_viewers > 0 && len(s.viewers) >= max_viewers {
@@ -209,101 +232,133 @@ session_attach_peer :: proc(s: ^Session, sock: net.TCP_Socket, peer: ^network.Pe
 			return {}, false
 		}
 		v = new(Viewer)
-		v.sock = sock
+		v.key = key
 		append(&s.viewers, v)
 	}
-	old = v.peer
+	old := v.peer
 	v.peer = peer
 	pending = v.pending
 	v.pending = {}
-	n := len(s.viewers)
+	count := len(s.viewers)
 	sync.unlock(&s.mu)
 
 	if old != nil && old != peer {
-		close_peer(old)
+		network.peer_close(old)
 	}
-	fmt.printf("viewer attached (n=%d)\n", n)
+	utils.log_info("viewer connected (%d watching)", count)
+	notify(s)
 	return pending, true
 }
 
-session_queue_ice :: proc(s: ^Session, sock: net.TCP_Socket, candidate, mid: string, max_viewers: int) {
+// session_add_ice hands a remote candidate to the client's peer, or queues it
+// until the offer arrives.
+session_add_ice :: proc(s: ^Session, key: rawptr, candidate, mid: string, max_viewers: int) {
 	if candidate == "" {
 		return
 	}
-
 	sync.lock(&s.mu)
-	i := viewer_index(s, sock)
+	defer sync.unlock(&s.mu)
+
 	v: ^Viewer
-	if i >= 0 {
+	if i := viewer_index(s, key); i >= 0 {
 		v = s.viewers[i]
-	} else if max_viewers > 0 && len(s.viewers) >= max_viewers {
-		sync.unlock(&s.mu)
-		return
 	} else {
+		if max_viewers > 0 && len(s.viewers) >= max_viewers {
+			return
+		}
 		v = new(Viewer)
-		v.sock = sock
+		v.key = key
 		append(&s.viewers, v)
 	}
 	if v.peer != nil {
-		peer := v.peer
-		sync.unlock(&s.mu)
-		network.peer_add_ice_candidate(peer, candidate, mid)
+		network.peer_add_ice_candidate(v.peer, candidate, mid)
 		return
 	}
-	append(&v.pending, Pending_Ice{
-		candidate = strings.clone(candidate),
-		mid       = strings.clone(mid),
-	})
-	sync.unlock(&s.mu)
+	if len(v.pending) < 64 {
+		append(&v.pending, Pending_Ice{strings.clone(candidate), strings.clone(mid)})
+	}
 }
 
-session_remove_viewer :: proc(s: ^Session, sock: net.TCP_Socket) -> (remaining: int, found: bool) {
+// session_remove_viewer drops a client's viewer and returns how many remain.
+session_remove_viewer :: proc(s: ^Session, key: rawptr) -> (remaining: int) {
 	v: ^Viewer
-
 	sync.lock(&s.mu)
-	i := viewer_index(s, sock)
-	if i >= 0 {
+	if i := viewer_index(s, key); i >= 0 {
 		v = s.viewers[i]
 		unordered_remove(&s.viewers, i)
-		found = true
 	}
 	remaining = len(s.viewers)
 	sync.unlock(&s.mu)
 
-	if found {
+	if v != nil {
+		had_peer := v.peer != nil
 		viewer_destroy(v)
-		fmt.printf("viewer removed (n=%d)\n", remaining)
+		if had_peer {
+			utils.log_info("viewer disconnected (%d watching)", remaining)
+		}
+		notify(s)
 	}
-	return remaining, found
+	return
 }
 
-session_request_keyframe :: proc(s: ^Session) {
+// session_request_keyframe asks for an IDR. Requests closer together than
+// KEYFRAME_MIN_INTERVAL collapse into one (browsers repeat PLI until the
+// keyframe arrives) unless `force` is set, which a viewer's track opening
+// uses: that viewer cannot decode anything sent before.
+session_request_keyframe :: proc(s: ^Session, force := false) {
 	sync.lock(&s.mu)
-	running := s.running
-	use_gpu := s.use_gpu
-	if running && s.key_armed && time.tick_since(s.last_key) < 500 * time.Millisecond {
-		sync.unlock(&s.mu)
+	defer sync.unlock(&s.mu)
+	if !s.running {
 		return
 	}
-	if running {
-		s.last_key = time.tick_now()
-		s.key_armed = true
+	if !force && s.key_armed && time.tick_since(s.last_key) < KEYFRAME_MIN_INTERVAL {
+		return
+	}
+	s.last_key = time.tick_now()
+	s.key_armed = true
+	sync.atomic_store(&s.key_wanted, true)
+}
+
+// session_set_monitor switches the captured monitor. The pipeline restarts on
+// the session thread; on_change fires once the new stream is up.
+session_set_monitor :: proc(s: ^Session, index: int) -> bool {
+	if index < 0 {
+		return false
+	}
+	if _, ok := core.monitor_by_index(index); !ok {
+		return false
+	}
+	sync.lock(&s.mu)
+	changed := s.monitor != index
+	s.monitor = index
+	if !s.running {
+		s.info.monitor = index
 	}
 	sync.unlock(&s.mu)
-	if !running {
-		return
+	if changed {
+		sync.atomic_store(&s.restart, true)
+		notify(s)
 	}
-	if use_gpu {
-		core.encoder_hw_request_keyframe(&s.enc_hw)
-	} else {
-		core.encoder_request_keyframe(&s.enc)
+	return true
+}
+
+session_monitor :: proc(s: ^Session) -> int {
+	sync.shared_lock(&s.mu)
+	defer sync.shared_unlock(&s.mu)
+	return s.monitor
+}
+
+@(private)
+notify :: proc(s: ^Session) {
+	if s.on_change != nil {
+		s.on_change(s.user)
 	}
 }
 
 @(private)
-viewer_index :: proc(s: ^Session, sock: net.TCP_Socket) -> int {
+viewer_index :: proc(s: ^Session, key: rawptr) -> int {
 	for v, i in s.viewers {
-		if v.sock == sock {
+		if v.key == key {
 			return i
 		}
 	}
@@ -311,23 +366,8 @@ viewer_index :: proc(s: ^Session, sock: net.TCP_Socket) -> int {
 }
 
 @(private)
-close_peer :: proc(peer: ^network.Peer) {
-	if peer == nil {
-		return
-	}
-	if peer.user != nil {
-		free(peer.user)
-		peer.user = nil
-	}
-	network.peer_close(peer)
-}
-
-@(private)
 viewer_destroy :: proc(v: ^Viewer) {
-	if v == nil {
-		return
-	}
-	close_peer(v.peer)
+	network.peer_close(v.peer)
 	for p in v.pending {
 		delete(p.candidate)
 		delete(p.mid)
@@ -336,116 +376,333 @@ viewer_destroy :: proc(v: ^Viewer) {
 	free(v)
 }
 
+// Audio capture thread: fan one Opus packet out to every viewer.
+@(private)
+session_audio_packet :: proc(user: rawptr, packet: []byte, capture_ns: i64) {
+	s := (^Session)(user)
+	seconds := f64(max(capture_ns - s.start_ns, 0)) / 1e9
+	sync.shared_lock(&s.mu)
+	defer sync.shared_unlock(&s.mu)
+	for v in s.viewers {
+		if v.peer != nil {
+			network.peer_send_audio(v.peer, packet, seconds)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline (session thread only)
+
+@(private)
+Pipeline :: struct {
+	cap:      core.Capture,
+	enc:      ^core.Encoder,
+	bad:      [dynamic]string, // encoders that opened but then failed to encode
+	failures: int,             // consecutive encode errors
+	denied:   bool,            // the last open was refused by the host
+}
+
+@(private)
+ENCODE_FAILURE_LIMIT :: 10
+
+@(private)
+pipeline_close :: proc(p: ^Pipeline) {
+	if p.enc != nil {
+		core.encoder_close(p.enc)
+		p.enc = nil
+	}
+	core.capture_close(&p.cap)
+}
+
+@(private)
+pipeline_open :: proc(s: ^Session, p: ^Pipeline) -> bool {
+	cfg := &s.cfg
+	sync.shared_lock(&s.mu)
+	monitor := s.monitor
+	sync.shared_unlock(&s.mu)
+
+	capture_opts := core.Capture_Options{
+		backend    = cfg.capture,
+		monitor    = monitor,
+		cursor     = cfg.cursor,
+		fps        = cfg.fps,
+		prefer_gpu = true,
+		input      = cfg.input,
+	}
+	cap, cerr := core.capture_open(capture_opts)
+	if cerr == .No_Output && monitor != 0 {
+		utils.log_warn("monitor %d does not exist; capturing monitor 0", monitor)
+		monitor = 0
+		capture_opts.monitor = 0
+		cap, cerr = core.capture_open(capture_opts)
+	}
+	p.denied = cerr == .Denied
+	if cerr == .Denied {
+		utils.log_info("the host did not allow screen sharing")
+		return false
+	}
+	if cerr != .None {
+		utils.log_error("screen capture could not be started: %v", cerr)
+		return false
+	}
+
+	w, h := utils.scaled_size(cfg.width, cfg.height, cap.width, cap.height)
+	enc_opts := core.Encoder_Options{width = w, height = h, fps = cfg.fps, bitrate_kbps = cfg.bitrate}
+
+	// GPU-fed encoders first (the frame never leaves the GPU), then CPU-fed
+	// ones, which need the capture reopened in system-memory mode.
+	enc: ^core.Encoder
+	eerr := core.Encoder_Error.Codec_Not_Found
+	zero_copy := false
+	if cap.gpu {
+		enc, eerr = core.encoder_open_zero_copy(cfg.encoder, &cap, enc_opts, p.bad[:])
+		if eerr != .None && !core.encoder_is_auto(cfg.encoder) && !core.encoder_exists_working(cfg.encoder, enc_opts, p.bad[:]) {
+			// The requested encoder does not work at all: fall back to the automatic choice.
+			utils.log_warn("encoder %s is not usable here; picking one automatically", cfg.encoder)
+			enc, eerr = core.encoder_open_zero_copy("h264", &cap, enc_opts, p.bad[:])
+		}
+		zero_copy = eerr == .None
+		if !zero_copy {
+			core.capture_close(&cap)
+			capture_opts.prefer_gpu = false
+			cap, cerr = core.capture_open(capture_opts)
+			if cerr != .None {
+				p.denied = cerr == .Denied
+				utils.log_error("screen capture could not be started: %v", cerr)
+				return false
+			}
+		}
+	}
+	if enc == nil {
+		enc, eerr = core.encoder_open_best(cfg.encoder, enc_opts, p.bad[:])
+	}
+	if eerr != .None {
+		utils.log_error("no usable H.264 encoder (%v); try -list-encoders", eerr)
+		core.capture_close(&cap)
+		return false
+	}
+
+	p.cap = cap
+	p.enc = enc
+	p.failures = 0
+
+	sync.lock(&s.mu)
+	delete(s.headers)
+	s.headers = nil
+	n := copy(s.enc_name[:], core.encoder_name(enc))
+	s.monitor = monitor
+	s.info.monitor = monitor
+	s.info.width = w
+	s.info.height = h
+	s.info.source_width = cap.width
+	s.info.source_height = cap.height
+	s.info.fps = cfg.fps
+	s.info.encoder = string(s.enc_name[:n])
+	s.info.capture = core.BACKEND_NAME[cap.backend]
+	sync.unlock(&s.mu)
+	sync.atomic_store(&s.key_wanted, true)
+
+	utils.log_info("streaming monitor %d: %dx%d -> %dx%d @ %d fps, %s capture, %s%s, %d kbps",
+		monitor, cap.width, cap.height, w, h, cfg.fps,
+		core.BACKEND_NAME[cap.backend], core.encoder_name(enc), " (zero-copy)" if zero_copy else "", cfg.bitrate)
+	return true
+}
+
+// Reopens the pipeline until it works or the session stops.
+@(private)
+pipeline_reopen :: proc(s: ^Session, p: ^Pipeline) -> bool {
+	pipeline_close(p)
+	delay := 100 * time.Millisecond
+	for session_running(s) {
+		if pipeline_open(s, p) {
+			notify(s)
+			return true
+		}
+		if p.denied {
+			session_end_denied(s)
+			return false
+		}
+		time.sleep(delay)
+		delay = min(delay * 2, 2 * time.Second)
+	}
+	return false
+}
+
+// The host refused or ended the share: stop serving and keep viewers from
+// re-triggering the request for a while. Runs on the session thread; the
+// owner finishes the teardown (session_stop) from on_ended.
+@(private)
+session_end_denied :: proc(s: ^Session) {
+	sync.lock(&s.mu)
+	s.denied_until = core.now_ns() + i64(DENIED_COOLDOWN)
+	was_running := s.running
+	s.running = false
+	sync.unlock(&s.mu)
+	if was_running && s.on_ended != nil {
+		s.on_ended(s.user)
+	}
+}
+
+@(private)
+session_running :: proc(s: ^Session) -> bool {
+	sync.shared_lock(&s.mu)
+	defer sync.shared_unlock(&s.mu)
+	return s.running
+}
+
 @(private)
 session_loop :: proc(s: ^Session) {
+	pipe: Pipeline
+	defer delete(pipe.bad)
+
+	s.start_ok = pipeline_open(s, &pipe)
+	if !s.start_ok && pipe.denied {
+		sync.lock(&s.mu)
+		s.denied_until = core.now_ns() + i64(DENIED_COOLDOWN)
+		sync.unlock(&s.mu)
+	}
+	sync.sema_post(&s.started)
+	if !s.start_ok {
+		return
+	}
+	defer {
+		pipeline_close(&pipe)
+		utils.log_info("capture stopped")
+	}
+
 	packets: [dynamic]core.Encoded_AU
 	defer delete(packets)
 	frame: core.Frame
 
-	fps := s.cfg.fps
-	if fps <= 0 {
-		fps = 30
-	}
-	frame_ns := i64(1_000_000_000) / i64(fps)
-	next_frame_ns := time.to_unix_nanoseconds(time.now())
+	frame_ns := i64(time.Second) / i64(max(s.cfg.fps, 1))
+	next_frame_ns := core.now_ns()
+	last_change_ns := next_frame_ns // last time the desktop actually changed
+	last_sent_ns := i64(0)
+	capture_failures := 0
 
-	for {
-		sync.shared_lock(&s.mu)
-		running := s.running
-		use_gpu := s.use_gpu
-		sync.shared_unlock(&s.mu)
-		if !running {
-			break
-		}
+	for session_running(s) {
+		free_all(context.temp_allocator)
 
-		now_ns := time.to_unix_nanoseconds(time.now())
-
-		// Drop when more than three frame periods behind (avoid starving the encoder).
-		if now_ns > next_frame_ns + 3 * frame_ns {
-			skip := (now_ns - next_frame_ns) / frame_ns
-			next_frame_ns += skip * frame_ns
-			continue
-		}
-
-		if now_ns + 500_000 < next_frame_ns {
-			remaining := next_frame_ns - now_ns
-			if remaining > 2_000_000 {
-				time.sleep(time.Duration(remaining - 1_000_000))
-			} else {
-				time.sleep(500 * time.Microsecond)
-			}
-			continue
-		}
-		next_frame_ns += frame_ns
-
-		cerr := core.capture_frame(&s.cap, &frame)
-		if cerr == .Timeout {
-			continue
-		}
-		if cerr == .Device_Lost {
-			fmt.eprintln("DXGI duplication lost; recreating")
-			core.capture_close(&s.cap)
-			cap, err := core.capture_open(s.cfg.monitor, s.cfg.cursor, use_gpu)
-			if err != .None {
-				fmt.eprintln("capture recreate failed:", err)
+		if sync.atomic_exchange(&s.restart, false) {
+			if !pipeline_reopen(s, &pipe) {
 				break
 			}
-			sync.lock(&s.mu)
-			s.cap = cap
-			sync.unlock(&s.mu)
+			next_frame_ns = core.now_ns()
+		}
+
+		if !pipe.cap.self_paced {
+			now := core.now_ns()
+			if now > next_frame_ns + 3 * frame_ns {
+				// Far behind (the capture blocked): resynchronize instead of bursting.
+				next_frame_ns = now
+			}
+			if wait := next_frame_ns - now; wait > 500_000 {
+				time.sleep(time.Duration(min(wait, 20_000_000)))
+				continue
+			}
+			next_frame_ns += frame_ns
+		}
+
+		cerr := core.capture_frame(&pipe.cap, &frame)
+		now := core.now_ns()
+		#partial switch cerr {
+		case .None:
+			capture_failures = 0
+			last_change_ns = now
+		case .Timeout:
+			// Nothing changed on screen. Re-encode the previous frame when a
+			// viewer needs a keyframe, for a moment after the last change (so
+			// the still image sharpens), and once a second as a keepalive.
+			if frame.width == 0 {
+				continue
+			}
+			idle := now - last_change_ns
+			if !sync.atomic_load(&s.key_wanted) && idle > i64(time.Second) && now - last_sent_ns < i64(time.Second) {
+				continue
+			}
+			frame.timestamp_ns = now
+		case .Denied:
+			session_end_denied(s)
+			return
+		case .Device_Lost:
+			utils.log_info("capture device lost (mode change or secure desktop); reopening")
+			if !pipeline_reopen(s, &pipe) {
+				return
+			}
+			capture_failures = 0
+			continue
+		case:
+			capture_failures += 1
+			if capture_failures >= 50 {
+				utils.log_warn("capture keeps failing (%v); reopening", cerr)
+				if !pipeline_reopen(s, &pipe) {
+					return
+				}
+				capture_failures = 0
+			} else {
+				time.sleep(5 * time.Millisecond)
+			}
 			continue
 		}
-		if cerr != .None {
-			time.sleep(5 * time.Millisecond)
-			continue
+
+		if sync.atomic_exchange(&s.key_wanted, false) {
+			core.encoder_request_keyframe(pipe.enc)
 		}
 
 		clear(&packets)
-		encode_err: core.Encoder_Error
-		if use_gpu && frame.gpu && frame.texture != nil {
-			encode_err = core.encoder_encode_d3d11(&s.enc_hw, frame.texture, &packets)
-		} else if len(frame.data) > 0 {
-			encode_err = core.encoder_encode_bgra(&s.enc, frame.data, frame.width, frame.height, frame.stride, &packets)
-		} else {
-			continue
-		}
-		if encode_err != .None {
-			if use_gpu {
-				fmt.eprintf("d3d11 encode: %v\n", encode_err)
+		if eerr := core.encoder_encode(pipe.enc, &frame, &packets); eerr != .None {
+			for au in packets {
+				delete(au.data)
+			}
+			pipe.failures += 1
+			if pipe.failures >= ENCODE_FAILURE_LIMIT {
+				name := strings.clone(core.encoder_name(pipe.enc))
+				utils.log_warn("encoder %s keeps failing (%v); switching encoder", name, eerr)
+				append(&pipe.bad, name)
+				if !pipeline_reopen(s, &pipe) {
+					return
+				}
 			}
 			continue
 		}
+		pipe.failures = 0
 		if len(packets) == 0 {
 			continue
 		}
-
-		if sync.shared_guard(&s.mu) {
-			for v in s.viewers {
-				if v.peer == nil {
-					continue
-				}
-				for au in packets {
-					ts_seconds := f64(au.pts) / f64(fps)
-					err := network.peer_send_h264(v.peer, au.data, ts_seconds, au.is_keyframe)
-					if err != .None && err != .Not_Open {
-						fmt.eprintf("h264 send failed: %v (%d bytes)\n", err, len(au.data))
-					}
+		if utils.log_is_verbose() {
+			for au in packets {
+				if au.is_keyframe {
+					utils.log_debug("keyframe: %d bytes", len(au.data))
 				}
 			}
+		}
+
+		seconds := f64(max(frame.timestamp_ns - s.start_ns, 0)) / 1e9
+		sync.shared_lock(&s.mu)
+		need_headers := s.headers == nil && pipe.enc.headers != nil
+		for v in s.viewers {
+			if v.peer == nil {
+				continue
+			}
+			for au in packets {
+				if err := network.peer_send_video(v.peer, au.data, seconds); err == .Send_Failed {
+					utils.log_debug("video send failed (%d bytes)", len(au.data))
+				}
+			}
+		}
+		sync.shared_unlock(&s.mu)
+		last_sent_ns = now
+
+		if need_headers {
+			sync.lock(&s.mu)
+			if s.headers == nil {
+				s.headers = make([]byte, len(pipe.enc.headers))
+				copy(s.headers, pipe.enc.headers)
+			}
+			sync.unlock(&s.mu)
 		}
 		for au in packets {
 			delete(au.data)
 		}
 	}
-
-	sync.lock(&s.mu)
-	use_gpu := s.use_gpu
-	sync.unlock(&s.mu)
-	if use_gpu {
-		core.encoder_hw_close(&s.enc_hw)
-	} else {
-		core.encoder_close(&s.enc)
-	}
-	core.capture_close(&s.cap)
-	fmt.println("capture+encode stopped")
 }

@@ -1,118 +1,166 @@
 package network
 
-import "core:fmt"
 import "core:strconv"
 import "core:strings"
-import rtc "../../vendor/libdatachannel"
 
-// Pick an H.264 payload type from a browser offer. Prefer packetization-mode=1
-// and profile-level-id=42e01f so the answer PT is the codec Chrome actually
-// associated with that number (PT 96 is often VP8).
-h264_select_from_offer :: proc(sdp: string) -> (pt: int, fmtp: string, ok: bool) {
-	pts: [16]int
-	fmtps: [16]string
-	n := 0
+// Just enough SDP parsing to answer a browser offer: which m-lines exist,
+// their mids, and which payload types the browser bound to H.264 and Opus.
 
-	it := sdp
-	for line in strings.split_lines_iterator(&it) {
-		l := strings.trim_right(line, "\r")
-		if pt_val, codec, found := parse_rtpmap(l); found {
-			if n < len(pts) && is_h264_codec(codec) {
-				pts[n] = pt_val
-				n += 1
-			}
-			continue
-		}
-		if pt_val, params, found := parse_fmtp(l); found {
-			for i in 0 ..< n {
-				if pts[i] == pt_val && fmtps[i] == "" {
-					fmtps[i] = params
-					break
+Offer_Media :: struct {
+	found: bool,
+	mid:   string,
+	pt:    int,
+	fmtp:  string,
+}
+
+Offer_Info :: struct {
+	video: Offer_Media, // best H.264 payload of the first video m-line
+	audio: Offer_Media, // Opus payload of the first audio m-line
+}
+
+@(private)
+MAX_H264_PAYLOADS :: 64 // browsers offer around ten; payload types are 7 bits
+
+// parse_offer extracts the media Odysseus can answer. The returned strings are slices of sdp.
+//
+// For video it prefers packetization-mode=1 and profile-level-id=42e01f so the
+// answer uses the payload type the browser actually associated with
+// constrained-baseline H.264 (PT 96 is usually VP8).
+parse_offer :: proc(sdp: string) -> (info: Offer_Info) {
+	Section :: enum { Other, Video, Audio }
+	h264_pts: [MAX_H264_PAYLOADS]int
+	h264_fmtps: [MAX_H264_PAYLOADS]string
+	h264_count := 0
+	opus_pt := -1
+
+	// Two passes: attribute order within a media section is not significant
+	// and Firefox emits a=fmtp before a=rtpmap. Pass 0 collects the payload
+	// types (rtpmap) and mids, pass 1 attaches the fmtp lines to them.
+	for pass in 0 ..< 2 {
+		section := Section.Other
+		video_seen, audio_seen := false, false
+		it := sdp
+		for raw in strings.split_lines_iterator(&it) {
+			line := strings.trim_right(raw, "\r")
+			switch {
+			case strings.has_prefix(line, "m=video"):
+				section = .Other if video_seen else .Video
+				video_seen = true
+			case strings.has_prefix(line, "m=audio"):
+				section = .Other if audio_seen else .Audio
+				audio_seen = true
+			case strings.has_prefix(line, "m="):
+				section = .Other
+			case strings.has_prefix(line, "a=mid:"):
+				if pass != 0 {
+					continue
+				}
+				mid := line[len("a=mid:"):]
+				#partial switch section {
+				case .Video: info.video.mid = mid
+				case .Audio: info.audio.mid = mid
+				}
+			case strings.has_prefix(line, "a=rtpmap:"):
+				if pass != 0 {
+					continue
+				}
+				pt, codec, ok := parse_pt_attribute(line, "a=rtpmap:")
+				if !ok {
+					continue
+				}
+				#partial switch section {
+				case .Video:
+					if h264_count < MAX_H264_PAYLOADS && codec_is(codec, "h264") {
+						h264_pts[h264_count] = pt
+						h264_count += 1
+					}
+				case .Audio:
+					if opus_pt < 0 && codec_is(codec, "opus") {
+						opus_pt = pt
+					}
+				}
+			case strings.has_prefix(line, "a=fmtp:"):
+				if pass != 1 {
+					continue
+				}
+				pt, params, ok := parse_pt_attribute(line, "a=fmtp:")
+				if !ok {
+					continue
+				}
+				#partial switch section {
+				case .Video:
+					for i in 0 ..< h264_count {
+						if h264_pts[i] == pt && h264_fmtps[i] == "" {
+							h264_fmtps[i] = params
+							break
+						}
+					}
+				case .Audio:
+					if pt == opus_pt {
+						info.audio.fmtp = params
+					}
 				}
 			}
 		}
 	}
-	if n == 0 {
-		return 0, "", false
-	}
 
-	best := 0
-	best_score := -1
-	for i in 0 ..< n {
-		s := h264_fmtp_score(fmtps[i])
-		if s > best_score {
-			best_score = s
-			best = i
+	if h264_count > 0 {
+		best, best_score := 0, 0
+		for i in 0 ..< h264_count {
+			if score := h264_fmtp_score(h264_fmtps[i]); score > best_score {
+				best, best_score = i, score
+			}
+		}
+		// Only packetization-mode 1 is usable: the stream is sent as STAP-A / FU-A,
+		// which a mode-0 receiver cannot depacketize.
+		if best_score > 0 {
+			info.video.found = true
+			info.video.pt = h264_pts[best]
+			info.video.fmtp = h264_fmtps[best]
+			if info.video.mid == "" {
+				info.video.mid = "0"
+			}
 		}
 	}
-	return pts[best], fmtps[best], true
+	if opus_pt >= 0 {
+		info.audio.found = true
+		info.audio.pt = opus_pt
+		if info.audio.mid == "" {
+			info.audio.mid = "1"
+		}
+	}
+	return
 }
 
-h264_answer_profile :: proc(offer_fmtp, encoder_profile: string) -> string {
-	// Encoder fmtp carries the correct profile-level-id and cached SPS/PPS.
-	if encoder_profile != "" {
-		return encoder_profile
-	}
-	base := offer_fmtp
-	if base == "" {
-		base = rtc.H264_WEBRTC_PROFILE
-	}
-	return base
-}
-
+// Parses "<prefix><pt> <rest>".
 @(private)
-parse_rtpmap :: proc(line: string) -> (pt: int, codec: string, ok: bool) {
-	prefix := "a=rtpmap:"
-	if !strings.has_prefix(line, prefix) {
-		return
-	}
-	rest := line[len(prefix):]
-	sp := strings.index_byte(rest, ' ')
+parse_pt_attribute :: proc(line, prefix: string) -> (pt: int, rest: string, ok: bool) {
+	body := line[len(prefix):]
+	sp := strings.index_byte(body, ' ')
 	if sp <= 0 {
 		return
 	}
-	pt, ok = strconv.parse_int(rest[:sp])
+	pt, ok = strconv.parse_int(body[:sp], 10)
 	if !ok {
 		return 0, "", false
 	}
-	return pt, rest[sp + 1:], true
+	return pt, body[sp + 1:], true
 }
 
+// True when an rtpmap encoding ("H264/90000", "opus/48000/2") names the codec.
 @(private)
-parse_fmtp :: proc(line: string) -> (pt: int, params: string, ok: bool) {
-	prefix := "a=fmtp:"
-	if !strings.has_prefix(line, prefix) {
-		return
-	}
-	rest := line[len(prefix):]
-	sp := strings.index_byte(rest, ' ')
-	if sp <= 0 {
-		return
-	}
-	pt, ok = strconv.parse_int(rest[:sp])
-	if !ok {
-		return 0, "", false
-	}
-	return pt, rest[sp + 1:], true
-}
-
-@(private)
-is_h264_codec :: proc(codec: string) -> bool {
-	if len(codec) < 4 {
+codec_is :: proc(encoding, name: string) -> bool {
+	if len(encoding) < len(name) || !ascii_eq_ci(encoding[:len(name)], name) {
 		return false
 	}
-	a := codec[0] | 0x20
-	b := codec[1]
-	c := codec[2]
-	d := codec[3] | 0x20
-	if a != 'h' || b != '2' || c != '6' || d != '4' {
-		return false
-	}
-	return len(codec) == 4 || codec[4] == '/'
+	return len(encoding) == len(name) || encoding[len(name)] == '/'
 }
 
 @(private)
 h264_fmtp_score :: proc(fmtp: string) -> int {
+	// 0 means unusable. An explicit mode 0 cannot take STAP-A / FU-A. A payload
+	// that does not say (RFC 6184 default: mode 0) is kept as a last resort,
+	// since some clients simply omit the parameter.
 	pm := fmtp_param(fmtp, "packetization-mode")
 	if pm == "0" {
 		return 0
@@ -132,56 +180,23 @@ h264_fmtp_score :: proc(fmtp: string) -> int {
 	return score
 }
 
-@(private)
+// fmtp_param returns the value of key in a "k=v;k=v" parameter list, "" if absent.
 fmtp_param :: proc(fmtp, key: string) -> string {
-	start := 0
-	for start < len(fmtp) {
-		rest := fmtp[start:]
-		idx := strings.index(rest, key)
-		if idx < 0 {
-			return ""
+	rest := fmtp
+	for item in strings.split_iterator(&rest, ";") {
+		kv := strings.trim_space(item)
+		eq := strings.index_byte(kv, '=')
+		if eq > 0 && kv[:eq] == key {
+			return kv[eq + 1:]
 		}
-		abs := start + idx
-		if abs > 0 {
-			prev := fmtp[abs - 1]
-			if prev != ';' && prev != ' ' {
-				start = abs + 1
-				continue
-			}
-		}
-		after := abs + len(key)
-		if after >= len(fmtp) || fmtp[after] != '=' {
-			start = abs + 1
-			continue
-		}
-		after += 1
-		end := after
-		for end < len(fmtp) && fmtp[end] != ';' {
-			end += 1
-		}
-		return fmtp[after:end]
 	}
 	return ""
 }
 
+// Compares s with a lower-case ASCII string, ignoring the case of s.
 @(private)
-sprop_from_profile :: proc(profile: string) -> string {
-	key := "sprop-parameter-sets="
-	idx := strings.index(profile, key)
-	if idx < 0 {
-		return ""
-	}
-	rest := profile[idx + len(key):]
-	end := strings.index_byte(rest, ';')
-	if end < 0 {
-		return rest
-	}
-	return rest[:end]
-}
-
-@(private)
-ascii_eq_ci :: proc(s, want: string) -> bool {
-	if len(s) != len(want) {
+ascii_eq_ci :: proc(s, lower: string) -> bool {
+	if len(s) != len(lower) {
 		return false
 	}
 	for i in 0 ..< len(s) {
@@ -189,7 +204,7 @@ ascii_eq_ci :: proc(s, want: string) -> bool {
 		if a >= 'A' && a <= 'Z' {
 			a += 32
 		}
-		if a != want[i] {
+		if a != lower[i] {
 			return false
 		}
 	}
@@ -197,9 +212,6 @@ ascii_eq_ci :: proc(s, want: string) -> bool {
 }
 
 @(private)
-ascii_has_prefix_ci :: proc(s, prefix: string) -> bool {
-	if len(s) < len(prefix) {
-		return false
-	}
-	return ascii_eq_ci(s[:len(prefix)], prefix)
+ascii_has_prefix_ci :: proc(s, lower_prefix: string) -> bool {
+	return len(s) >= len(lower_prefix) && ascii_eq_ci(s[:len(lower_prefix)], lower_prefix)
 }

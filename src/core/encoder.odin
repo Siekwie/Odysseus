@@ -1,37 +1,17 @@
 package core
 
+import "core:strings"
+import "core:sync"
+
 import ffmpeg "../../vendor/ffmpeg"
 import "../utils"
-import "core:encoding/base64"
-import "core:fmt"
 
-// H.264 encoder wrapping FFmpeg. You still own the capture -> encode -> WebRTC loop;
-// this package opens the codec, converts BGRA, and returns length-prefixed (AVCC) access units.
+// H.264 encoding through FFmpeg. encoder_open_best walks a per-platform list
+// of encoders and keeps the first one that actually opens, so a machine
+// without the preferred GPU still streams (down to libx264 on the CPU).
+// Access units come back as AVCC, already packed for WebRTC.
 
-Encoder :: struct {
-	codec:     ^ffmpeg.AVCodec,
-	ctx:       ^ffmpeg.AVCodecContext,
-	frame:     ^ffmpeg.AVFrame,
-	packet:    ^ffmpeg.AVPacket,
-	sws:       ^ffmpeg.Sws_Context,
-	width:     i32,
-	height:    i32,
-	fps:       i32,
-	src_w:     i32,
-	src_h:     i32,
-	pix_fmt:   ffmpeg.Pixel_Format,
-	pts:       i64,
-	name:              string,
-	force_key:         bool,
-	headers:           []byte, // AVCC SPS/PPS copied from extradata or the first IDR
-	profile_level_id:  string, // WebRTC fmtp, e.g. 42e029 for 4.1, 42e032 for 5.0
-}
-
-Encoded_AU :: struct {
-	data:        []byte, // copy of the FFmpeg packet; free with delete()
-	pts:         i64,
-	is_keyframe: bool,
-}
+KEYFRAME_INTERVAL_SECONDS :: 4
 
 Encoder_Error :: enum {
 	None,
@@ -40,231 +20,191 @@ Encoder_Error :: enum {
 	Open_Failed,
 	Scale_Failed,
 	Send_Failed,
-	Stub_Libs,
+	Bad_Frame,
 }
 
-PREFERRED_ENCODERS := [?]cstring{
-	"h264_nvenc",
-	"h264_qsv",
-	"h264_amf",
-	"h264_videotoolbox",
-	"h264_vaapi",
-	"libx264",
+Encoder_Options :: struct {
+	width:        int,
+	height:       int,
+	fps:          int,
+	bitrate_kbps: int,
 }
 
-detect_encoders :: proc() -> (found: [dynamic]string) {
-	found = make([dynamic]string)
-	for name in PREFERRED_ENCODERS {
-		if ffmpeg.avcodec_find_encoder_by_name(name) != nil {
-			append(&found, string(name))
-		}
+Encoder :: struct {
+	ctx:          ^ffmpeg.AVCodecContext,
+	frame:        ^ffmpeg.AVFrame,
+	packet:       ^ffmpeg.AVPacket,
+	sws:          ^ffmpeg.Sws_Context,
+	width:        int,
+	height:       int,
+	fps:          int,
+	input_format: ffmpeg.Pixel_Format, // what the codec is fed (nv12 / yuv420p / d3d11)
+	pts:          i64,
+	name_buf:     [32]u8,
+	name_len:     int,
+	force_key:    bool, // atomic; set by encoder_request_keyframe from any thread
+	force_tries:  int,
+	headers:      []byte, // AVCC SPS/PPS from the first keyframe
+	merged:       [dynamic]byte,
+
+	// GPU input path (Windows D3D11), nil for CPU-fed encoders.
+	hw:        rawptr,
+	hw_encode: proc(enc: ^Encoder, src: ^Frame, out: ^[dynamic]Encoded_AU) -> Encoder_Error,
+	hw_close:  proc(enc: ^Encoder),
+}
+
+Encoded_AU :: struct {
+	data:        []byte, // WebRTC-ready AVCC; free with delete()
+	pts:         i64,
+	is_keyframe: bool,
+}
+
+// Encoders tried for "-encoder:h264", best first.
+when ODIN_OS == .Windows {
+	AUTO_ENCODERS := [?]string{"h264_nvenc", "h264_amf", "h264_qsv", "libx264", "h264_mf", "libopenh264"}
+} else when ODIN_OS == .Darwin {
+	AUTO_ENCODERS := [?]string{"h264_videotoolbox", "libx264", "libopenh264"}
+} else {
+	AUTO_ENCODERS := [?]string{"h264_nvenc", "h264_qsv", "libx264", "libopenh264", "h264_v4l2m2m"}
+}
+
+encoder_is_auto :: proc(requested: string) -> bool {
+	return requested == "" || requested == "h264" || requested == "auto"
+}
+
+encoder_name :: proc(enc: ^Encoder) -> string {
+	return string(enc.name_buf[:enc.name_len])
+}
+
+@(private)
+encoder_set_name :: proc(enc: ^Encoder, name: string) {
+	enc.name_len = copy(enc.name_buf[:], name)
+}
+
+encoder_exists :: proc(name: string) -> bool {
+	cname := strings.clone_to_cstring(name, context.temp_allocator)
+	return ffmpeg.avcodec_find_encoder_by_name(cname) != nil
+}
+
+// encoder_open_best opens the requested encoder, or the first working one of
+// AUTO_ENCODERS. Names in `skip` are not tried (encoders that opened earlier
+// but then failed to produce frames).
+encoder_open_best :: proc(requested: string, opts: Encoder_Options, skip: []string = nil) -> (enc: ^Encoder, err: Encoder_Error) {
+	// Probing encoders for absent hardware is expected to fail noisily.
+	level := ffmpeg.av_log_get_level()
+	if !utils.log_is_verbose() {
+		ffmpeg.av_log_set_level(ffmpeg.AV_LOG_FATAL)
 	}
-	return
-}
+	defer ffmpeg.av_log_set_level(level)
 
-resolve_encoder_name :: proc(requested: string) -> cstring {
-	if requested == "" || requested == "h264" {
-		for name in PREFERRED_ENCODERS {
-			if ffmpeg.avcodec_find_encoder_by_name(name) != nil {
-				return name
+	skipped :: proc(name: string, skip: []string) -> bool {
+		for s in skip {
+			if s == name {
+				return true
 			}
 		}
-		return "libx264"
-	}
-	return strings_to_cstring(requested)
-}
-
-@(private)
-_encoder_name_buf: [64]u8
-
-strings_to_cstring :: proc(s: string) -> cstring {
-	n := min(len(s), len(_encoder_name_buf) - 1)
-	copy(_encoder_name_buf[:n], s)
-	_encoder_name_buf[n] = 0
-	return cstring(&_encoder_name_buf[0])
-}
-
-encoder_open :: proc(cfg: utils.Config) -> (enc: Encoder, err: Encoder_Error) {
-	when ffmpeg.STUB_LIBS {
-		return {}, .Stub_Libs
+		return false
 	}
 
-	name := resolve_encoder_name(cfg.encoder)
-	codec := ffmpeg.avcodec_find_encoder_by_name(name)
+	err = .Codec_Not_Found
+	if !encoder_is_auto(requested) && !skipped(requested, skip) {
+		if enc, err = encoder_open(requested, opts); err == .None {
+			return
+		}
+		utils.log_debug("encoder %s: %v", requested, err)
+	}
+	for name in AUTO_ENCODERS {
+		if name == requested || skipped(name, skip) {
+			continue
+		}
+		e, open_err := encoder_open(name, opts)
+		if open_err == .None {
+			return e, .None
+		}
+		utils.log_debug("encoder %s: %v", name, open_err)
+		if open_err != .Codec_Not_Found {
+			err = open_err
+		}
+	}
+	return nil, err
+}
+
+// encoder_exists_working reports whether the named encoder opens when fed CPU frames.
+encoder_exists_working :: proc(name: string, opts: Encoder_Options, skip: []string = nil) -> bool {
+	for s in skip {
+		if s == name {
+			return false
+		}
+	}
+	level := ffmpeg.av_log_get_level()
+	if !utils.log_is_verbose() {
+		ffmpeg.av_log_set_level(ffmpeg.AV_LOG_FATAL)
+	}
+	defer ffmpeg.av_log_set_level(level)
+	enc, err := encoder_open(name, opts)
+	if err != .None {
+		return false
+	}
+	encoder_close(enc)
+	return true
+}
+
+// encoder_open opens one named FFmpeg encoder fed with CPU frames.
+encoder_open :: proc(name: string, opts: Encoder_Options) -> (enc: ^Encoder, err: Encoder_Error) {
+	cname := strings.clone_to_cstring(name, context.temp_allocator)
+	codec := ffmpeg.avcodec_find_encoder_by_name(cname)
 	if codec == nil {
-		return {}, .Codec_Not_Found
+		return nil, .Codec_Not_Found
 	}
 
-	ctx := ffmpeg.avcodec_alloc_context3(codec)
-	if ctx == nil {
-		return {}, .Alloc_Failed
+	input := encoder_input_format(name)
+	if input == ffmpeg.PIX_FMT_NONE {
+		return nil, .Open_Failed
 	}
 
-	w := i32(cfg.width)
-	h := i32(cfg.height)
-	fps := i32(cfg.fps)
-	if w <= 0 { w = 1920 }
-	if h <= 0 { h = 1080 }
-	if fps <= 0 { fps = 30 }
-
-	ctx.width = w
-	ctx.height = h
-	ctx.pix_fmt = ffmpeg.PIX_FMT_YUV420P
-	ctx.time_base = ffmpeg.rational(1, fps)
-	ctx.framerate = ffmpeg.rational(fps, 1)
-	ctx.bit_rate = i64(cfg.bitrate) * 1000
-	ctx.flags |= ffmpeg.AV_CODEC_FLAG_LOW_DELAY
-	ctx.sample_aspect_ratio = ffmpeg.rational(1, 1)
-
-	apply_encoder_options(ctx, name, fps)
-
-	opts: ^ffmpeg.AVDictionary
-	if ffmpeg.avcodec_open2(ctx, codec, &opts) < 0 {
-		ffmpeg.av_dict_free(&opts)
-		ffmpeg.avcodec_free_context(&ctx)
-		return {}, .Open_Failed
+	e := new(Encoder)
+	defer if err != .None {
+		encoder_close(e)
 	}
-	ffmpeg.av_dict_free(&opts)
+	encoder_set_name(e, name)
+	e.width = opts.width
+	e.height = opts.height
+	e.fps = opts.fps if opts.fps > 0 else 30
+	e.input_format = input
 
-	headers: []byte
-	if ctx.extradata != nil && ctx.extradata_size > 0 {
-		headers = param_sets_from_extradata(ctx.extradata[:ctx.extradata_size])
+	e.ctx = ffmpeg.avcodec_alloc_context3(codec)
+	if e.ctx == nil {
+		return nil, .Alloc_Failed
+	}
+	if !encoder_configure(e.ctx, name, e.width, e.height, e.fps, opts.bitrate_kbps, input, true) {
+		return nil, .Open_Failed
+	}
+	if rc := ffmpeg.avcodec_open2(e.ctx, codec, nil); rc < 0 {
+		buf: [ffmpeg.AV_ERROR_MAX_STRING_SIZE]u8
+		utils.log_debug("%s: avcodec_open2: %s", name, ffmpeg.error_string(rc, buf[:]))
+		return nil, .Open_Failed
 	}
 
-	frame := ffmpeg.av_frame_alloc()
-	packet := ffmpeg.av_packet_alloc()
-	if frame == nil || packet == nil {
-		delete(headers)
-		encoder_close(&Encoder{ctx = ctx, frame = frame, packet = packet})
-		return {}, .Alloc_Failed
+	e.frame = ffmpeg.av_frame_alloc()
+	e.packet = ffmpeg.av_packet_alloc()
+	if e.frame == nil || e.packet == nil {
+		return nil, .Alloc_Failed
 	}
-	frame.format = i32(ffmpeg.PIX_FMT_YUV420P)
-	frame.width = w
-	frame.height = h
-	if ffmpeg.av_frame_get_buffer(frame, 32) < 0 {
-		encoder_close(&Encoder{ctx = ctx, frame = frame, packet = packet, headers = headers})
-		return {}, .Alloc_Failed
+	e.frame.format = i32(input)
+	e.frame.width = i32(e.width)
+	e.frame.height = i32(e.height)
+	if ffmpeg.av_frame_get_buffer(e.frame, 0) < 0 {
+		return nil, .Alloc_Failed
 	}
-
-	enc = {
-		codec   = codec,
-		ctx     = ctx,
-		frame   = frame,
-		packet  = packet,
-		width   = w,
-		height  = h,
-		fps     = fps,
-		pix_fmt  = ffmpeg.PIX_FMT_YUV420P,
-		name     = string(name),
-		headers  = headers,
-		profile_level_id = h264_profile_level_id(w, h, fps),
-	}
-	return enc, .None
-}
-
-// Pick the lowest H.264 level that fits resolution and frame rate (ITU-T H.264 Table A-1).
-@(private)
-h264_pick_level :: proc(w, h, fps: i32) -> cstring {
-	rate := fps
-	if rate <= 0 {
-		rate = 30
-	}
-	mb_w := (w + 15) / 16
-	mb_h := (h + 15) / 16
-	mb := i64(mb_w) * i64(mb_h)
-	mbps := mb * i64(rate)
-
-	// MaxFS, MaxMBPS per level.
-	if mb <= 8192 && mbps <= 245760 {
-		return "4.1"
-	}
-	if mb <= 22080 && mbps <= 589824 {
-		return "5.0"
-	}
-	if mb <= 36864 && mbps <= 983040 {
-		return "5.1"
-	}
-	return "5.2"
-}
-
-// Constrained-baseline profile-level-id for WebRTC fmtp (42e0 + level_idc hex).
-h264_profile_level_id :: proc(w, h, fps: i32) -> string {
-	level := h264_pick_level(w, h, fps)
-	level_idc: u8 = 31
-	switch level {
-	case "4.1":
-		level_idc = 41
-	case "5.0":
-		level_idc = 50
-	case "5.1":
-		level_idc = 51
-	case "5.2":
-		level_idc = 52
-	}
-	return fmt.tprintf("42e0%02x", level_idc)
-}
-
-@(private)
-apply_encoder_options :: proc(ctx: ^ffmpeg.AVCodecContext, name: cstring, fps: i32) {
-	child: i32 = ffmpeg.AV_OPT_SEARCH_CHILDREN
-	gop := i64(fps)
-	if gop <= 0 {
-		gop = 30
-	}
-	// GOP on the codec context (not only private encoder options).
-	ffmpeg.av_opt_set_int(ctx, "g", gop, 0)
-	ffmpeg.av_opt_set_int(ctx, "g", gop, child)
-	ffmpeg.av_opt_set_int(ctx, "bf", 0, 0)
-	ffmpeg.av_opt_set_int(ctx, "bf", 0, child)
-	ffmpeg.av_opt_set_int(ctx, "profile", 578, 0) // constrained baseline
-	ffmpeg.av_opt_set(ctx, "profile", "baseline", child)
-	level := h264_pick_level(ctx.width, ctx.height, fps)
-	ffmpeg.av_opt_set(ctx, "level", level, child)
-	// Length-prefixed NALs so RTP packetization does not scan 00 00 01 inside slices.
-	ffmpeg.av_opt_set(ctx, "annexb", "0", child)
-	ffmpeg.av_opt_set(ctx, "aud", "0", child)
-	ffmpeg.av_opt_set(ctx, "coder", "cavlc", child)
-	br := ctx.bit_rate
-	if br > 0 {
-		ffmpeg.av_opt_set_int(ctx, "maxrate", br, child)
-		ffmpeg.av_opt_set_int(ctx, "bufsize", br, child)
-	}
-
-	switch name {
-	case "h264_nvenc":
-		// NVENC tune is hq/ll/ull/lossless — not x264's zerolatency.
-		ffmpeg.av_opt_set(ctx, "preset", "p1", child)
-		ffmpeg.av_opt_set(ctx, "tune", "ull", child)
-		ffmpeg.av_opt_set(ctx, "rc", "cbr", child)
-		ffmpeg.av_opt_set_int(ctx, "delay", 0, child)
-		ffmpeg.av_opt_set(ctx, "zerolatency", "1", child)
-		ffmpeg.av_opt_set(ctx, "repeat-headers", "1", child)
-		ffmpeg.av_opt_set_int(ctx, "gop", gop, child)
-		ffmpeg.av_opt_set_int(ctx, "b_adapt", 0, child)
-		ffmpeg.av_opt_set_int(ctx, "rc-lookahead", 0, child)
-	case "h264_qsv":
-		ffmpeg.av_opt_set(ctx, "preset", "veryfast", child)
-		ffmpeg.av_opt_set_int(ctx, "look_ahead", 0, child)
-		ffmpeg.av_opt_set(ctx, "repeat_headers", "1", child)
-	case "h264_amf":
-		ffmpeg.av_opt_set(ctx, "usage", "ultralowlatency", child)
-		ffmpeg.av_opt_set(ctx, "profile", "constrained_baseline", child)
-		ffmpeg.av_opt_set(ctx, "header_insertion_mode", "gop", child)
-	case "libx264":
-		ffmpeg.av_opt_set(ctx, "preset", "ultrafast", child)
-		ffmpeg.av_opt_set(ctx, "tune", "zerolatency", child)
-		ffmpeg.av_opt_set(ctx, "repeat_headers", "1", child)
-	}
+	return e, .None
 }
 
 encoder_close :: proc(enc: ^Encoder) {
-	if enc.headers != nil {
-		delete(enc.headers)
-		enc.headers = nil
+	if enc == nil {
+		return
 	}
 	if enc.sws != nil {
 		ffmpeg.sws_freeContext(enc.sws)
-		enc.sws = nil
 	}
 	if enc.frame != nil {
 		ffmpeg.av_frame_free(&enc.frame)
@@ -275,76 +215,200 @@ encoder_close :: proc(enc: ^Encoder) {
 	if enc.ctx != nil {
 		ffmpeg.avcodec_free_context(&enc.ctx)
 	}
+	// After the codec context: it holds references into the hardware frame pool.
+	if enc.hw_close != nil {
+		enc.hw_close(enc)
+	}
+	delete(enc.headers)
+	delete(enc.merged)
+	free(enc)
 }
 
+// encoder_request_keyframe makes the next encoded frame an IDR. Safe from any thread.
 encoder_request_keyframe :: proc(enc: ^Encoder) {
-	enc.force_key = true
+	sync.atomic_store(&enc.force_key, true)
 }
 
-// Convert a BGRA desktop frame to the encoder size/format and produce H.264 access units.
-encoder_encode_bgra :: proc(enc: ^Encoder, bgra: []byte, src_w, src_h, stride: int, packets: ^[dynamic]Encoded_AU) -> Encoder_Error {
-	if enc.ctx == nil || enc.frame == nil {
-		return .Alloc_Failed
+// Software frame layout each encoder is fed with.
+@(private)
+encoder_input_format :: proc(name: string) -> ffmpeg.Pixel_Format {
+	switch name {
+	case "libx264", "libopenh264":
+		return ffmpeg.pix_fmt("yuv420p")
 	}
-	if len(bgra) == 0 {
-		return .Scale_Failed
+	return ffmpeg.pix_fmt("nv12")
+}
+
+// Applies every setting through AVOptions; AVCodecContext's layout differs
+// between FFmpeg releases, the option names do not.
+@(private)
+encoder_configure :: proc(
+	ctx: ^ffmpeg.AVCodecContext,
+	name: string,
+	w, h, fps, bitrate_kbps: int,
+	input: ffmpeg.Pixel_Format,
+	yuv_input: bool,
+) -> bool {
+	child: i32 = ffmpeg.AV_OPT_SEARCH_CHILDREN
+	bitrate := i64(bitrate_kbps) * 1000
+	gop := i64(fps * KEYFRAME_INTERVAL_SECONDS)
+	level := h264_pick_level(w, h, fps)
+
+	if ffmpeg.av_opt_set_image_size(ctx, "video_size", i32(w), i32(h), 0) < 0 ||
+	   ffmpeg.av_opt_set_pixel_fmt(ctx, "pixel_format", input, 0) < 0 ||
+	   ffmpeg.av_opt_set_q(ctx, "time_base", ffmpeg.rational(1, i32(fps)), 0) < 0 {
+		utils.log_error("this FFmpeg build does not expose the codec options Odysseus needs")
+		return false
+	}
+	ffmpeg.av_opt_set_int(ctx, "b", bitrate, 0)
+	ffmpeg.av_opt_set_int(ctx, "maxrate", bitrate, 0)
+	ffmpeg.av_opt_set_int(ctx, "bufsize", bitrate, 0)
+	ffmpeg.av_opt_set_int(ctx, "g", gop, 0)
+	ffmpeg.av_opt_set_int(ctx, "bf", 0, 0)
+	ffmpeg.av_opt_set(ctx, "flags", "+low_delay", 0)
+
+	// Constrained baseline, the one profile every WebRTC browser decodes.
+	ffmpeg.av_opt_set_int(ctx, "profile", 578, 0)
+	ffmpeg.av_opt_set(ctx, "profile", "baseline", child)
+	ffmpeg.av_opt_set_int(ctx, "level", i64(level.idc), 0)
+	ffmpeg.av_opt_set(ctx, "level", level.name, child)
+	ffmpeg.av_opt_set(ctx, "aud", "0", child)
+	// A requested keyframe must be an IDR with parameter sets, not a plain I-frame,
+	// or a viewer that just joined has nothing to start decoding from.
+	ffmpeg.av_opt_set(ctx, "forced-idr", "1", child)
+	ffmpeg.av_opt_set(ctx, "forced_idr", "1", child)
+
+	if yuv_input {
+		// swscale converts desktop RGB to limited-range BT.709; say so in the VUI.
+		ffmpeg.av_opt_set(ctx, "colorspace", "bt709", 0)
+		ffmpeg.av_opt_set(ctx, "color_primaries", "bt709", 0)
+		ffmpeg.av_opt_set(ctx, "color_trc", "bt709", 0)
+		ffmpeg.av_opt_set(ctx, "color_range", "tv", 0)
 	}
 
-	src_w_i := i32(src_w if src_w > 0 else int(enc.width))
-	src_h_i := i32(src_h if src_h > 0 else int(enc.height))
-	src_stride := i32(stride)
+	switch name {
+	case "h264_nvenc":
+		// NVENC tune is hq/ll/ull/lossless, not x264's zerolatency.
+		ffmpeg.av_opt_set(ctx, "preset", "p1", child)
+		ffmpeg.av_opt_set(ctx, "tune", "ull", child)
+		ffmpeg.av_opt_set(ctx, "rc", "cbr", child)
+		ffmpeg.av_opt_set_int(ctx, "delay", 0, child)
+		ffmpeg.av_opt_set(ctx, "zerolatency", "1", child)
+		ffmpeg.av_opt_set_int(ctx, "rc-lookahead", 0, child)
+		ffmpeg.av_opt_set(ctx, "coder", "cavlc", child)
+	case "h264_qsv":
+		ffmpeg.av_opt_set(ctx, "preset", "veryfast", child)
+		ffmpeg.av_opt_set_int(ctx, "look_ahead", 0, child)
+		ffmpeg.av_opt_set_int(ctx, "async_depth", 1, child)
+	case "h264_amf":
+		ffmpeg.av_opt_set(ctx, "usage", "ultralowlatency", child)
+		ffmpeg.av_opt_set(ctx, "profile", "constrained_baseline", child)
+		ffmpeg.av_opt_set(ctx, "rc", "cbr", child)
+		ffmpeg.av_opt_set(ctx, "header_insertion_mode", "idr", child)
+	case "h264_videotoolbox":
+		ffmpeg.av_opt_set(ctx, "realtime", "1", child)
+		ffmpeg.av_opt_set(ctx, "allow_sw", "1", child)
+		ffmpeg.av_opt_set(ctx, "prio_speed", "1", child)
+	case "h264_mf":
+		ffmpeg.av_opt_set(ctx, "rate_control", "cbr", child)
+		ffmpeg.av_opt_set(ctx, "scenario", "display_remoting", child)
+	case "libx264":
+		ffmpeg.av_opt_set(ctx, "preset", "ultrafast", child)
+		ffmpeg.av_opt_set(ctx, "tune", "zerolatency", child)
+		ffmpeg.av_opt_set(ctx, "coder", "cavlc", child)
+	case "libopenh264":
+		ffmpeg.av_opt_set(ctx, "profile", "constrained_baseline", child)
+		ffmpeg.av_opt_set(ctx, "rc_mode", "bitrate", child)
+	}
+	return true
+}
 
+// encoder_encode converts one captured frame to the codec's input and appends
+// the resulting access units to `out` (usually zero or one).
+encoder_encode :: proc(enc: ^Encoder, src: ^Frame, out: ^[dynamic]Encoded_AU) -> Encoder_Error {
+	if enc.hw_encode != nil {
+		return enc.hw_encode(enc, src, out)
+	}
+	if src.planes[0] == nil || src.width <= 0 || src.height <= 0 {
+		return .Bad_Frame
+	}
+
+	scaling := src.width != enc.width || src.height != enc.height
+	prev := enc.sws
 	enc.sws = ffmpeg.sws_getCachedContext(
 		enc.sws,
-		src_w_i, src_h_i, ffmpeg.PIX_FMT_BGRA,
-		enc.width, enc.height, enc.pix_fmt,
-		ffmpeg.SWS_FAST_BILINEAR,
+		i32(src.width), i32(src.height), src.format,
+		i32(enc.width), i32(enc.height), enc.input_format,
+		ffmpeg.SWS_BILINEAR if scaling else ffmpeg.SWS_FAST_BILINEAR,
 		nil, nil, nil,
 	)
 	if enc.sws == nil {
 		return .Scale_Failed
 	}
+	if enc.sws != prev {
+		// Full-range RGB in, limited-range BT.709 out (matches the VUI set in encoder_configure).
+		bt709 := ffmpeg.sws_getCoefficients(ffmpeg.SWS_CS_ITU709)
+		ffmpeg.sws_setColorspaceDetails(enc.sws, bt709, 1, bt709, 0, 0, 1 << 16, 1 << 16)
+	}
 
-	src_planes: [1]^u8 = { raw_data(bgra) }
-	src_strides: [1]i32 = { src_stride }
-	dst_planes := ([^]^u8)(&enc.frame.data[0])
-	dst_strides := ([^]i32)(&enc.frame.linesize[0])
+	// The codec may still hold the buffers of the previous frame.
+	if ffmpeg.av_frame_make_writable(enc.frame) < 0 {
+		return .Alloc_Failed
+	}
+	planes := src.planes
+	strides := src.strides
 	scaled := ffmpeg.sws_scale(
 		enc.sws,
-		raw_data(src_planes[:]),
-		raw_data(src_strides[:]),
+		raw_data(planes[:]),
+		raw_data(strides[:]),
 		0,
-		src_h_i,
-		dst_planes,
-		dst_strides,
+		i32(src.height),
+		raw_data(enc.frame.data[:]),
+		raw_data(enc.frame.linesize[:]),
 	)
 	if scaled <= 0 {
 		return .Scale_Failed
 	}
+	return encoder_submit(enc, out)
+}
 
-	enc.frame.pts = enc.pts
+// Stamps enc.frame, sends it to the codec and collects the packets.
+encoder_submit :: proc(enc: ^Encoder, out: ^[dynamic]Encoded_AU) -> Encoder_Error {
+	ffmpeg.frame_set_pts(enc.frame, enc.pts)
 	enc.pts += 1
-	if enc.force_key {
-		enc.frame.pict_type = ffmpeg.AV_PICTURE_TYPE_I
-	} else {
-		enc.frame.pict_type = 0
-	}
+
+	want_key := sync.atomic_load(&enc.force_key)
+	ffmpeg.frame_set_pict_type(enc.frame, ffmpeg.AV_PICTURE_TYPE_I if want_key else ffmpeg.AV_PICTURE_TYPE_NONE)
 
 	send := ffmpeg.avcodec_send_frame(enc.ctx, enc.frame)
-	if send < 0 && !ffmpeg.is_again(send) {
+	if ffmpeg.is_again(send) {
+		// Output queue is full: drain it, then the frame is accepted.
+		if err := encoder_drain(enc, out); err != .None {
+			return err
+		}
+		send = ffmpeg.avcodec_send_frame(enc.ctx, enc.frame)
+	}
+	if send < 0 {
+		buf: [ffmpeg.AV_ERROR_MAX_STRING_SIZE]u8
+		utils.log_debug("%s: send_frame: %s", encoder_name(enc), ffmpeg.error_string(send, buf[:]))
 		return .Send_Failed
 	}
-
-	return drain_encoder_packets(enc, packets)
+	if want_key {
+		// Give up after a few frames if this codec cannot be forced, rather than
+		// asking for an intra frame forever.
+		enc.force_tries += 1
+		if enc.force_tries >= 3 {
+			enc.force_tries = 0
+			sync.atomic_store(&enc.force_key, false)
+		}
+	}
+	return encoder_drain(enc, out)
 }
 
 @(private)
-drain_encoder_packets :: proc(enc: ^Encoder, packets: ^[dynamic]Encoded_AU) -> Encoder_Error {
-	merged: [dynamic]byte
-	defer delete(merged)
-	is_key := false
+encoder_drain :: proc(enc: ^Encoder, out: ^[dynamic]Encoded_AU) -> Encoder_Error {
+	clear(&enc.merged)
 	pts: i64
-	got := false
 	for {
 		ffmpeg.av_packet_unref(enc.packet)
 		recv := ffmpeg.avcodec_receive_packet(enc.ctx, enc.packet)
@@ -354,430 +418,46 @@ drain_encoder_packets :: proc(enc: ^Encoder, packets: ^[dynamic]Encoded_AU) -> E
 		if recv < 0 {
 			return .Send_Failed
 		}
-		n := int(enc.packet.size)
-		raw := enc.packet.data[:n]
-		data := h264_to_avcc(raw)
-		append(&merged, ..data)
-		delete(data)
-		if (enc.packet.flags & ffmpeg.AV_PKT_FLAG_KEY) != 0 {
-			is_key = true
+		if enc.packet.size <= 0 || enc.packet.data == nil {
+			continue
 		}
+		avcc := h264_to_avcc(enc.packet.data[:enc.packet.size], context.temp_allocator)
+		append(&enc.merged, ..avcc)
 		pts = enc.packet.pts
-		got = true
 	}
-	if !got || len(merged) == 0 {
+	ffmpeg.av_packet_unref(enc.packet)
+	if len(enc.merged) == 0 {
 		return .None
 	}
 
-	out := make([]byte, len(merged))
-	copy(out, merged[:])
-	if is_key {
-		out = ensure_param_sets(enc, out)
-		enc.force_key = false
+	if enc.headers == nil {
+		enc.headers = h264_extract_param_sets(enc.merged[:])
 	}
-	is_key = avcc_has_nal(out, 5)
-
-	append(packets, Encoded_AU{
-		data        = out,
-		pts         = pts,
-		is_keyframe = is_key,
-	})
+	data, is_key := h264_prepare_for_webrtc(enc.merged[:], enc.headers)
+	if data == nil {
+		return .None
+	}
+	if is_key {
+		enc.force_tries = 0
+		sync.atomic_store(&enc.force_key, false)
+	}
+	append(out, Encoded_AU{data = data, pts = pts, is_keyframe = is_key})
 	return .None
 }
 
-@(private)
-avcc_append_length_nal :: proc(out: ^[dynamic]byte, nal: []byte) {
-	n := len(nal)
-	if n <= 0 {
-		return
-	}
-	append(out, u8((n >> 24) & 0xFF), u8((n >> 16) & 0xFF), u8((n >> 8) & 0xFF), u8(n & 0xFF))
-	append(out, ..nal)
-}
+// probe_encoders returns the AUTO_ENCODERS that open on this machine (names are static).
+probe_encoders :: proc(allocator := context.allocator) -> [dynamic]string {
+	level := ffmpeg.av_log_get_level()
+	ffmpeg.av_log_set_level(ffmpeg.AV_LOG_QUIET)
+	defer ffmpeg.av_log_set_level(level)
 
-// Build an RFC 6184 STAP-A NAL (type 24) containing SPS + PPS. Chrome drops isolated
-// SPS/PPS RTP packets, so they must share one RTP packet before the IDR.
-@(private)
-h264_build_stap_a :: proc(sps, pps: []byte) -> []byte {
-	if len(sps) == 0 || len(pps) == 0 {
-		return nil
-	}
-	out := make([]byte, 1 + 2 + len(sps) + 2 + len(pps))
-	out[0] = 0x78 // F=0, NRI=3, type=24 (STAP-A)
-	i := 1
-	out[i] = u8((len(sps) >> 8) & 0xFF)
-	out[i + 1] = u8(len(sps) & 0xFF)
-	i += 2
-	copy(out[i:], sps)
-	i += len(sps)
-	out[i] = u8((len(pps) >> 8) & 0xFF)
-	out[i + 1] = u8(len(pps) & 0xFF)
-	i += 2
-	copy(out[i:], pps)
-	return out
-}
-
-// Repack AVCC access units for WebRTC: STAP-A (SPS+PPS) before IDR on keyframes,
-// strip SEI/AUD/filler, keep slice NALs only.
-h264_avcc_prepare_for_webrtc :: proc(src: []byte, is_keyframe: bool) -> []byte {
-	if len(src) == 0 {
-		return nil
-	}
-
-	sps: []byte
-	pps: []byte
-	slices: [dynamic][]byte
-	defer delete(slices)
-
-	i := 0
-	for i + 4 <= len(src) {
-		n := int(src[i]) << 24 | int(src[i + 1]) << 16 | int(src[i + 2]) << 8 | int(src[i + 3])
-		i += 4
-		if n <= 0 || i + n > len(src) {
-			break
-		}
-		nal := src[i:i + n]
-		t := nal[0] & 0x1F
-		switch t {
-		case 7:
-			if sps == nil {
-				sps = make([]byte, n)
-				copy(sps, nal)
-			}
-		case 8:
-			if pps == nil {
-				pps = make([]byte, n)
-				copy(pps, nal)
-			}
-		case 6, 9, 12, 0:
-			// drop SEI, AUD, filler, reserved
-		case:
-			s := make([]byte, n)
-			copy(s, nal)
-			append(&slices, s)
-		}
-		i += n
-	}
-
-	out: [dynamic]byte
-	if is_keyframe {
-		if stap := h264_build_stap_a(sps, pps); stap != nil {
-			avcc_append_length_nal(&out, stap)
-			delete(stap)
+	working := make([dynamic]string, allocator)
+	for name in AUTO_ENCODERS {
+		enc, err := encoder_open(name, {width = 1280, height = 720, fps = 30, bitrate_kbps = 4000})
+		if err == .None {
+			append(&working, name)
+			encoder_close(enc)
 		}
 	}
-	delete(sps)
-	delete(pps)
-
-	for s in slices {
-		avcc_append_length_nal(&out, s)
-		delete(s)
-	}
-
-	if len(out) == 0 {
-		if h264_valid_length_prefixed_avcc(src) {
-			return avcc_copy_filtered(src)
-		}
-		if h264_is_single_nal(src) {
-			return avcc_wrap_single_nal(src)
-		}
-		return nil
-	}
-	return out[:]
-}
-
-// WebRTC fmtp line including optional sprop-parameter-sets from cached SPS/PPS.
-h264_webrtc_profile :: proc(headers: []byte, profile_level_id: string = "42e01f") -> string {
-	plid := profile_level_id if profile_level_id != "" else "42e01f"
-	base := fmt.tprintf("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=%s", plid)
-	if sprop := h264_sprop_parameter_sets(headers); sprop != "" {
-		return fmt.tprintf("%s;sprop-parameter-sets=%s", base, sprop)
-	}
-	return base
-}
-
-h264_sprop_parameter_sets :: proc(avcc: []byte) -> string {
-	sps, pps := h264_avcc_param_sets(avcc)
-	if len(sps) == 0 || len(pps) == 0 {
-		return ""
-	}
-	defer delete(sps)
-	defer delete(pps)
-	sps_b64, _ := base64.encode(sps)
-	pps_b64, _ := base64.encode(pps)
-	defer delete(sps_b64)
-	defer delete(pps_b64)
-	return fmt.tprintf("%s,%s", sps_b64, pps_b64)
-}
-
-h264_avcc_param_sets :: proc(src: []byte) -> (sps, pps: []byte) {
-	i := 0
-	for i + 4 <= len(src) {
-		n := int(src[i]) << 24 | int(src[i + 1]) << 16 | int(src[i + 2]) << 8 | int(src[i + 3])
-		i += 4
-		if n <= 0 || i + n > len(src) {
-			break
-		}
-		nal := src[i:i + n]
-		t := nal[0] & 0x1F
-		if t == 7 && sps == nil {
-			sps = make([]byte, n)
-			copy(sps, nal)
-		} else if t == 8 && pps == nil {
-			pps = make([]byte, n)
-			copy(pps, nal)
-		}
-		i += n
-	}
-	return
-}
-
-@(private)
-h264_is_single_nal :: proc(src: []byte) -> bool {
-	if len(src) < 1 {
-		return false
-	}
-	nal_type := src[0] & 0x1F
-	return nal_type > 0 && nal_type < 24
-}
-
-@(private)
-h264_valid_length_prefixed_avcc :: proc(src: []byte) -> bool {
-	i := 0
-	for i + 4 <= len(src) {
-		n := int(src[i]) << 24 | int(src[i + 1]) << 16 | int(src[i + 2]) << 8 | int(src[i + 3])
-		i += 4
-		if n <= 0 || i + n > len(src) {
-			return false
-		}
-		i += n
-	}
-	return i == len(src) && len(src) >= 5
-}
-
-@(private)
-avcc_wrap_single_nal :: proc(nal: []byte) -> []byte {
-	n := len(nal)
-	out := make([]byte, 4 + n)
-	out[0] = u8((n >> 24) & 0xFF)
-	out[1] = u8((n >> 16) & 0xFF)
-	out[2] = u8((n >> 8) & 0xFF)
-	out[3] = u8(n & 0xFF)
-	copy(out[4:], nal)
-	return out
-}
-
-@(private)
-avcc_append_nal :: proc(out: ^[dynamic]byte, nal: []byte) {
-	n := len(nal)
-	if n <= 0 {
-		return
-	}
-	t := nal[0] & 0x1F
-	if t == 0 || t == 6 || t == 9 || t == 12 {
-		return
-	}
-	append(out, u8((n >> 24) & 0xFF), u8((n >> 16) & 0xFF), u8((n >> 8) & 0xFF), u8(n & 0xFF))
-	append(out, ..nal)
-}
-
-@(private)
-param_sets_from_extradata :: proc(src: []byte) -> []byte {
-	if len(src) == 0 {
-		return nil
-	}
-	if start_code_len(src, 0) > 0 {
-		avcc := h264_to_avcc(src)
-		sets := extract_param_sets(avcc)
-		delete(avcc)
-		return sets
-	}
-	if src[0] != 1 || len(src) < 7 {
-		return h264_to_avcc(src)
-	}
-
-	out: [dynamic]byte
-	i := 6
-	nsps := int(src[5] & 0x1F)
-	for _ in 0 ..< nsps {
-		if i + 2 > len(src) {
-			break
-		}
-		n := int(src[i]) << 8 | int(src[i + 1])
-		i += 2
-		if n < 0 || i + n > len(src) {
-			break
-		}
-		avcc_append_nal(&out, src[i:i + n])
-		i += n
-	}
-	if i >= len(src) {
-		return out[:]
-	}
-	npps := int(src[i])
-	i += 1
-	for _ in 0 ..< npps {
-		if i + 2 > len(src) {
-			break
-		}
-		n := int(src[i]) << 8 | int(src[i + 1])
-		i += 2
-		if n < 0 || i + n > len(src) {
-			break
-		}
-		avcc_append_nal(&out, src[i:i + n])
-		i += n
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out[:]
-}
-
-@(private)
-ensure_param_sets :: proc(enc: ^Encoder, data: []byte) -> []byte {
-	has_sps := avcc_has_nal(data, 7)
-	has_pps := avcc_has_nal(data, 8)
-	if has_sps && has_pps {
-		if len(enc.headers) == 0 {
-			enc.headers = extract_param_sets(data)
-		}
-		return data
-	}
-	if len(enc.headers) == 0 {
-		return data
-	}
-	out := make([]byte, len(enc.headers) + len(data))
-	copy(out, enc.headers)
-	copy(out[len(enc.headers):], data)
-	delete(data)
-	return out
-}
-
-@(private)
-extract_param_sets :: proc(data: []byte) -> []byte {
-	out: [dynamic]byte
-	i := 0
-	for i + 4 <= len(data) {
-		n := int(data[i]) << 24 | int(data[i + 1]) << 16 | int(data[i + 2]) << 8 | int(data[i + 3])
-		i += 4
-		if n <= 0 || i + n > len(data) {
-			break
-		}
-		t := data[i] & 0x1F
-		if t == 7 || t == 8 {
-			avcc_append_nal(&out, data[i:i + n])
-		}
-		i += n
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out[:]
-}
-
-@(private)
-avcc_has_nal :: proc(data: []byte, nal_type: u8) -> bool {
-	i := 0
-	for i + 4 <= len(data) {
-		n := int(data[i]) << 24 | int(data[i + 1]) << 16 | int(data[i + 2]) << 8 | int(data[i + 3])
-		i += 4
-		if n <= 0 || i + n > len(data) {
-			return false
-		}
-		if (data[i] & 0x1F) == nal_type {
-			return true
-		}
-		i += n
-	}
-	return false
-}
-
-@(private)
-start_code_len :: proc(data: []byte, i: int) -> int {
-	if i + 4 <= len(data) && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1 {
-		return 4
-	}
-	if i + 3 <= len(data) && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
-		return 3
-	}
-	return 0
-}
-
-// Length-prefixed NALs for libdatachannel's Length separator.
-// Valid AVCC is classified first: a 256..65535-byte length prefix is 00 00 01 xx
-// and would otherwise be mistaken for a 3-byte Annex-B start code.
-h264_to_avcc :: proc(src: []byte) -> []byte {
-	if len(src) == 0 {
-		return nil
-	}
-	if h264_valid_length_prefixed_avcc(src) {
-		return avcc_copy_filtered(src)
-	}
-	if start_code_len(src, 0) > 0 {
-		return h264_annexb_to_avcc(src)
-	}
-	if h264_is_single_nal(src) {
-		return avcc_wrap_single_nal(src)
-	}
-	return nil
-}
-
-@(private)
-avcc_copy_filtered :: proc(src: []byte) -> []byte {
-	out: [dynamic]byte
-	i := 0
-	ok := false
-	for i + 4 <= len(src) {
-		n := int(src[i]) << 24 | int(src[i + 1]) << 16 | int(src[i + 2]) << 8 | int(src[i + 3])
-		i += 4
-		if n <= 0 || i + n > len(src) {
-			ok = false
-			break
-		}
-		avcc_append_nal(&out, src[i:i + n])
-		i += n
-		ok = true
-	}
-	if !ok || len(out) == 0 {
-		delete(out)
-		if h264_is_single_nal(src) {
-			return avcc_wrap_single_nal(src)
-		}
-		return nil
-	}
-	return out[:]
-}
-
-h264_annexb_to_avcc :: proc(src: []byte) -> []byte {
-	if len(src) == 0 {
-		return nil
-	}
-	out: [dynamic]byte
-	i := 0
-	for i < len(src) {
-		sc := start_code_len(src, i)
-		if sc == 0 {
-			i += 1
-			continue
-		}
-		nal := i + sc
-		next := len(src)
-		j := nal
-		for j < len(src) {
-			if start_code_len(src, j) > 0 {
-				next = j
-				break
-			}
-			j += 1
-		}
-		if nal < next {
-			avcc_append_nal(&out, src[nal:next])
-		}
-		i = next
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out[:]
+	return working
 }

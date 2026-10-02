@@ -1,19 +1,19 @@
 package ffmpeg
 
-// Minimal FFmpeg 8.x types for encoding BGRA/NV12/YUV420P to H.264.
-// Struct layouts match FFmpeg n8.1. Do not stack-allocate AVCodecContext or
-// AVFrame; only use pointers returned by avcodec_alloc_context3 / av_frame_alloc.
+// Types shared by the bindings. Structs that FFmpeg changes between releases
+// are declared opaque or as a stable prefix only; never size_of() them and
+// only use pointers returned by the matching FFmpeg allocator.
 
-AV_NUM_DATA_POINTERS         :: 8
-AV_INPUT_BUFFER_PADDING_SIZE :: 64
-AV_ERROR_MAX_STRING_SIZE     :: 64
-AV_OPT_SEARCH_CHILDREN       :: 1
-AV_PKT_FLAG_KEY              :: 0x0001
-AV_CODEC_FLAG_LOW_DELAY      :: 1 << 19
-AV_CODEC_FLAG_GLOBAL_HEADER  :: 1 << 22
-AV_PICTURE_TYPE_I            :: 1
+AV_NUM_DATA_POINTERS     :: 8
+AV_ERROR_MAX_STRING_SIZE :: 64
+AV_OPT_SEARCH_CHILDREN   :: 1
+AV_PKT_FLAG_KEY          :: 0x0001
+AV_PICTURE_TYPE_NONE     :: 0
+AV_PICTURE_TYPE_I        :: 1
 
 AV_LOG_QUIET   :: -8
+AV_LOG_PANIC   :: 0
+AV_LOG_FATAL   :: 8
 AV_LOG_ERROR   :: 16
 AV_LOG_WARNING :: 24
 AV_LOG_INFO    :: 32
@@ -24,16 +24,24 @@ SWS_FAST_BILINEAR :: 1
 SWS_BILINEAR      :: 2
 SWS_BICUBIC       :: 4
 
-// POSIX EAGAIN; FFmpeg's Windows compat headers use the same value.
-AVERROR_EAGAIN :: i32(-11)
-AVERROR_EOF    :: i32(-0x20464F45) // FFERRTAG('E','O','F',' ')
+SWS_CS_ITU709 :: 1
+SWS_CS_ITU601 :: 5
+
+// AVERROR(EAGAIN): errno values differ per platform.
+when ODIN_OS == .Darwin || ODIN_OS == .FreeBSD || ODIN_OS == .OpenBSD || ODIN_OS == .NetBSD {
+	AVERROR_EAGAIN :: i32(-35)
+} else {
+	AVERROR_EAGAIN :: i32(-11)
+}
+AVERROR_EOF :: i32(-0x20464F45) // FFERRTAG('E','O','F',' ')
 
 Pixel_Format :: distinct i32
+PIX_FMT_NONE :: Pixel_Format(-1)
 
-PIX_FMT_NONE    :: Pixel_Format(-1)
-PIX_FMT_YUV420P :: Pixel_Format(0)
-PIX_FMT_NV12    :: Pixel_Format(23)
-PIX_FMT_BGRA    :: Pixel_Format(28)
+Sample_Format :: distinct i32
+SAMPLE_FMT_NONE :: Sample_Format(-1)
+SAMPLE_FMT_S16  :: Sample_Format(1) // interleaved signed 16 bit; stable since FFmpeg 0.x
+SAMPLE_FMT_FLT  :: Sample_Format(3) // interleaved 32 bit float
 
 HW_Device_Type :: enum i32 {
 	None         = 0,
@@ -56,88 +64,62 @@ AVRational :: struct {
 	den: i32,
 }
 
-AVDictionary    :: struct {}
 AVBuffer_Ref :: struct {
 	buffer: rawptr,
-	data:   rawptr,
-	size:   uint, // size_t on FFmpeg win64
-}
-Sws_Context     :: struct {}
-Sws_Filter      :: struct {}
-
-// Public fields only. Name/id are enough to list available encoders.
-AVCodec :: struct {
-	name:         cstring,
-	long_name:    cstring,
-	type:         i32,
-	id:           i32,
-	capabilities: i32,
+	data:   [^]u8,
+	size:   uint,
 }
 
-// FFmpeg 7.1 prefix of AVCodecContext. Remaining C fields exist past pix_fmt;
-// never size_of() this or allocate it yourself.
-AVCodecContext :: struct {
-	av_class:            rawptr,
-	log_level_offset:    i32,
-	codec_type:          i32,
-	codec:               ^AVCodec,
-	codec_id:            i32,
-	codec_tag:           u32,
-	priv_data:           rawptr,
-	internal:            rawptr,
-	opaque:              rawptr,
-	bit_rate:            i64,
-	flags:               i32,
-	flags2:              i32,
-	extradata:           [^]u8,
-	extradata_size:      i32,
-	time_base:           AVRational,
-	pkt_timebase:        AVRational,
-	framerate:           AVRational,
-	delay:               i32,
-	width:               i32,
-	height:              i32,
-	coded_width:         i32,
-	coded_height:        i32,
-	sample_aspect_ratio: AVRational,
-	pix_fmt:             Pixel_Format,
-}
+AVDictionary      :: struct {}
+AVCodec           :: struct {}
+AVCodecContext    :: struct {}
+AVCodecParameters :: struct {}
+AVInputFormat     :: struct {}
+Sws_Context       :: struct {}
+Sws_Filter        :: struct {}
 
-// FFmpeg 8.x prefix through buf[] (offset 176 on x64). Never size_of() this.
+// Prefix of AVFrame that has not moved since FFmpeg 5. Later fields
+// (pict_type, pts, buf) are reached through the accessors in abi.odin.
 AVFrame :: struct {
-	data:                [AV_NUM_DATA_POINTERS][^]u8,
-	linesize:            [AV_NUM_DATA_POINTERS]i32,
-	extended_data:       [^][^]u8,
-	width:               i32,
-	height:              i32,
-	nb_samples:          i32,
-	format:              i32,
-	pict_type:           i32,
-	sample_aspect_ratio: AVRational,
-	pts:                 i64,
-	pkt_dts:             i64,
-	time_base:           AVRational,
-	quality:             i32,
-	opaque:              rawptr,
-	repeat_pict:         i32,
-	sample_rate:         i32,
-	buf:                 [AV_NUM_DATA_POINTERS]^AVBuffer_Ref,
+	data:          [AV_NUM_DATA_POINTERS][^]u8,
+	linesize:      [AV_NUM_DATA_POINTERS]i32,
+	extended_data: [^][^]u8,
+	width:         i32,
+	height:        i32,
+	nb_samples:    i32,
+	format:        i32,
 }
 
-// Full FFmpeg 7.1 AVPacket ABI.
+#assert(offset_of(AVFrame, width) == 104)
+#assert(offset_of(AVFrame, format) == 116)
+
+// Prefix of AVPacket, unchanged since FFmpeg 5.
 AVPacket :: struct {
-	buf:             ^AVBuffer_Ref,
-	pts:             i64,
-	dts:             i64,
-	data:            [^]u8,
-	size:            i32,
-	stream_index:    i32,
-	flags:           i32,
-	side_data:       rawptr,
-	side_data_elems: i32,
-	duration:        i64,
-	pos:             i64,
-	opaque:          rawptr,
-	opaque_ref:      ^AVBuffer_Ref,
-	time_base:       AVRational,
+	buf:          ^AVBuffer_Ref,
+	pts:          i64,
+	dts:          i64,
+	data:         [^]u8,
+	size:         i32,
+	stream_index: i32,
+	flags:        i32,
+}
+
+// Prefix of AVFormatContext, unchanged since FFmpeg 4.
+AVFormatContext :: struct {
+	av_class:   rawptr,
+	iformat:    ^AVInputFormat,
+	oformat:    rawptr,
+	priv_data:  rawptr,
+	pb:         rawptr,
+	ctx_flags:  i32,
+	nb_streams: u32,
+	streams:    [^]^AVStream,
+}
+
+// Prefix of AVStream as of libavformat 60 (FFmpeg 6.0). Older releases have no av_class.
+AVStream :: struct {
+	av_class: rawptr,
+	index:    i32,
+	id:       i32,
+	codecpar: ^AVCodecParameters,
 }

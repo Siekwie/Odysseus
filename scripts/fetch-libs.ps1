@@ -1,16 +1,52 @@
-# Fetch / rebuild native libs used by Odysseus (Windows x64).
-# Runtime artifacts that belong in git live under:
+# Rebuilds the native libraries vendored for Windows x64. You only need this
+# to update them: the results are committed under
 #   vendor/ffmpeg/{bin,lib}
 #   vendor/libdatachannel/{bin,lib}
 # Source trees (vendor/mbedtls, vendor/libdatachannel/upstream) are gitignored.
+#
+# Needs on PATH: git, cmake, and a MinGW-w64 toolchain (gcc, gendef, dlltool).
+#
+# FFmpeg: download a "win64-gpl-shared" build from
+#   https://github.com/BtbN/FFmpeg-Builds/releases
+# and copy its bin\*.dll into vendor\ffmpeg\bin. This script then regenerates
+# the import libraries in vendor\ffmpeg\lib from those DLLs.
 
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
-$Mingw = "C:\Users\Jannik.Wiest\scoop\apps\mingw\current\bin"
-$env:PATH = "$Mingw;C:\Program Files\CMake\bin;" + $env:PATH
 
-Write-Host "FFmpeg n8.1 win64 gpl-shared is already under vendor/ffmpeg."
-Write-Host "  Source: https://github.com/BtbN/FFmpeg-Builds/releases (ffmpeg-n8.1-latest-win64-gpl-shared-8.1)"
+foreach ($tool in "git", "cmake", "gcc", "gendef", "dlltool") {
+	if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
+		Write-Error "$tool is not on PATH (install a MinGW-w64 toolchain, e.g. 'scoop install mingw' or MSYS2)"
+		exit 1
+	}
+}
+$Mingw = Split-Path -Parent (Get-Command gcc).Source
+
+# Creates <name>.lib in $LibDir for the newest <name>-*.dll in $BinDir.
+function New-ImportLib {
+	param([string]$BinDir, [string]$LibDir, [string]$Name, [string]$DllPattern)
+	$dll = Get-ChildItem $BinDir -Filter $DllPattern | Sort-Object Name | Select-Object -Last 1
+	if (-not $dll) {
+		Write-Warning "no $DllPattern in $BinDir"
+		return
+	}
+	Push-Location $BinDir
+	try {
+		gendef $dll.Name | Out-Null
+		$def = [IO.Path]::ChangeExtension($dll.Name, ".def")
+		dlltool -d $def -l (Join-Path $LibDir "$Name.lib") -D $dll.Name
+		Remove-Item $def -ErrorAction SilentlyContinue
+	} finally {
+		Pop-Location
+	}
+}
+
+$ffBin = Join-Path $Root "vendor\ffmpeg\bin"
+$ffLib = Join-Path $Root "vendor\ffmpeg\lib"
+Write-Host "Generating FFmpeg import libraries from vendor\ffmpeg\bin ..."
+foreach ($name in "avcodec", "avutil", "swscale", "avformat", "avdevice") {
+	New-ImportLib $ffBin $ffLib $name "$name-*.dll"
+}
 
 $ldcSrc = Join-Path $Root "vendor\libdatachannel\upstream"
 $ldcBuild = Join-Path $Root "vendor\libdatachannel\build"
@@ -36,7 +72,7 @@ function Set-MbedtlsDefine {
 
 if (-not (Test-Path (Join-Path $ldcSrc "CMakeLists.txt"))) {
 	Write-Host "Cloning libdatachannel (recursive)..."
-	git clone --depth 1 --recursive https://github.com/paullouisageneau/libdatachannel.git $ldcSrc
+	git clone --depth 1 --branch v0.24.5 --recursive https://github.com/paullouisageneau/libdatachannel.git $ldcSrc
 }
 
 if (-not (Test-Path (Join-Path $mbedtls "CMakeLists.txt"))) {
@@ -75,14 +111,10 @@ cmake --build $ldcBuild --config Release -j 8
 
 $bin = Join-Path $Root "vendor\libdatachannel\bin"
 $lib = Join-Path $Root "vendor\libdatachannel\lib"
-New-Item -ItemType Directory -Force -Path $bin,$lib | Out-Null
+New-Item -ItemType Directory -Force -Path $bin, $lib | Out-Null
 Copy-Item (Join-Path $ldcBuild "libdatachannel.dll") (Join-Path $bin "libdatachannel.dll") -Force
-foreach ($dll in @("libstdc++-6.dll","libgcc_s_seh-1.dll","libwinpthread-1.dll")) {
+foreach ($dll in @("libstdc++-6.dll", "libgcc_s_seh-1.dll", "libwinpthread-1.dll")) {
 	Copy-Item (Join-Path $Mingw $dll) (Join-Path $bin $dll) -Force
 }
-Push-Location $bin
-gendef libdatachannel.dll
-dlltool -d libdatachannel.def -l (Join-Path $lib "datachannel.lib") -D libdatachannel.dll -k
-Remove-Item libdatachannel.def -ErrorAction SilentlyContinue
-Pop-Location
+New-ImportLib $bin $lib "datachannel" "libdatachannel.dll"
 Write-Host "Vendored libdatachannel into vendor/libdatachannel/{bin,lib}"
