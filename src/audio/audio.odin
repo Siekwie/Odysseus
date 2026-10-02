@@ -1,5 +1,6 @@
 package audio
 
+import "core:math"
 import "core:sync"
 import "core:time"
 
@@ -243,4 +244,38 @@ opus_encode :: proc(s: ^Stream, capture_ns: i64) {
 		}
 		ffmpeg.av_packet_unref(s.packet)
 	}
+}
+
+// encode_test runs `frames` 20 ms frames of a 440 Hz tone through the Opus
+// encoder and reports what came out; used by `odysseus -self-test` to verify
+// the encoder setup against the linked FFmpeg without an audio device.
+encode_test :: proc(frames: int) -> (packets, bytes: int, ok: bool) {
+	Count :: struct {
+		packets: int,
+		bytes:   int,
+	}
+	count: Count
+	s := new(Stream)
+	defer free(s)
+	s.user = &count
+	s.sink = proc(user: rawptr, packet: []byte, capture_ns: i64) {
+		c := (^Count)(user)
+		c.packets += 1
+		c.bytes += len(packet)
+	}
+	if !opus_open(s, 128) {
+		opus_close(s)
+		return 0, 0, false
+	}
+	for n in 0 ..< frames {
+		for i in 0 ..< FRAME_SAMPLES {
+			t := f64(n * FRAME_SAMPLES + i) / SAMPLE_RATE
+			sample := i16(8000 * math.sin(2 * math.PI * 440 * t))
+			s.pending[2 * i] = sample
+			s.pending[2 * i + 1] = sample
+		}
+		opus_encode(s, 0)
+	}
+	opus_close(s)
+	return count.packets, count.bytes, true
 }

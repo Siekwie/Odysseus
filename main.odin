@@ -31,7 +31,7 @@ main :: proc() {
 	}
 
 	utils.log_set_verbose(cfg.verbose)
-	listing := cfg.list_monitors || cfg.list_encoders
+	listing := cfg.list_monitors || cfg.list_encoders || cfg.self_test
 	if !listing {
 		utils.log_open(cfg.log)
 	}
@@ -51,6 +51,9 @@ main :: proc() {
 	if cfg.list_encoders {
 		print_encoders()
 		return
+	}
+	if cfg.self_test {
+		os.exit(0 if self_test() else 1)
 	}
 
 	utils.log_info("Odysseus %s (libavcodec %d, libavutil %d)", utils.VERSION, v.avcodec, v.avutil)

@@ -152,6 +152,7 @@ Flags use Odin style, `-name:value`. Run `odysseus -help` for the full list.
 | `-verbose` | off | Debug output, including FFmpeg and WebRTC library messages |
 | `-list-monitors` | | Print the monitors and exit |
 | `-list-encoders` | | Probe which H.264 encoders work on this machine and exit |
+| `-self-test` | | Encode synthetic video and audio to verify the encoders and the linked FFmpeg, then exit |
 
 Example for a smooth 1080p60 stream:
 
@@ -246,6 +247,7 @@ Odysseus/
 ```bash
 ./build.sh test          # unit tests            (.\build.ps1 test on Windows)
 ./build.sh check         # type-check all targets without linking
+./build/odysseus -self-test   # encoders + FFmpeg ABI check, no screen or network needed
 bash tests/e2e/run.sh -- -monitor:1          # headless browser against a real capture
 E2E_XVFB=1 bash tests/e2e/run.sh             # Linux: private X server with a test pattern
 bash tests/e2e/wayland.sh                    # Linux: headless sway + portal + PipeWire

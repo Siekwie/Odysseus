@@ -31,6 +31,7 @@ Config :: struct {
 	verbose:       bool   `args:"name=verbose" usage:"Log debug output, including FFmpeg and WebRTC library messages."`,
 	list_monitors: bool   `args:"name=list-monitors" usage:"Print the monitors that can be captured and exit."`,
 	list_encoders: bool   `args:"name=list-encoders" usage:"Print the H.264 encoders that work on this machine and exit."`,
+	self_test:     bool   `args:"name=self-test" usage:"Encode synthetic video and audio to verify the encoders and the linked FFmpeg, then exit."`,
 	version:       bool   `args:"name=version" usage:"Print the version and exit."`,
 }
 

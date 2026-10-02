@@ -350,9 +350,10 @@ encoder_configure :: proc(
 	ffmpeg.av_opt_set_int(ctx, "bf", 0, 0)
 	ffmpeg.av_opt_set(ctx, "flags", "+low_delay", 0)
 
-	// Constrained baseline, the one profile every WebRTC browser decodes.
+	// Constrained baseline, the one profile every WebRTC browser decodes. The
+	// generic option is numeric; encoders with their own "profile" option get
+	// its name below.
 	ffmpeg.av_opt_set_int(ctx, "profile", 578, 0)
-	ffmpeg.av_opt_set(ctx, "profile", "baseline", child)
 	ffmpeg.av_opt_set_int(ctx, "level", i64(level.idc), 0)
 	ffmpeg.av_opt_set(ctx, "level", level.name, child)
 	ffmpeg.av_opt_set(ctx, "aud", "0", child)
@@ -372,6 +373,7 @@ encoder_configure :: proc(
 	switch name {
 	case "h264_nvenc":
 		// NVENC tune is hq/ll/ull/lossless, not x264's zerolatency.
+		ffmpeg.av_opt_set(ctx, "profile", "baseline", child)
 		ffmpeg.av_opt_set(ctx, "preset", "p1", child)
 		ffmpeg.av_opt_set(ctx, "tune", "ull", child)
 		ffmpeg.av_opt_set(ctx, "rc", "cbr", child)
@@ -380,6 +382,7 @@ encoder_configure :: proc(
 		ffmpeg.av_opt_set_int(ctx, "rc-lookahead", 0, child)
 		ffmpeg.av_opt_set(ctx, "coder", "cavlc", child)
 	case "h264_qsv":
+		ffmpeg.av_opt_set(ctx, "profile", "baseline", child)
 		ffmpeg.av_opt_set(ctx, "preset", "veryfast", child)
 		ffmpeg.av_opt_set_int(ctx, "look_ahead", 0, child)
 		ffmpeg.av_opt_set_int(ctx, "async_depth", 1, child)
@@ -392,13 +395,18 @@ encoder_configure :: proc(
 		ffmpeg.av_opt_set(ctx, "rc_mode", "CBR", child)
 		ffmpeg.av_opt_set_int(ctx, "async_depth", 1, child)
 	case "h264_videotoolbox":
+		ffmpeg.av_opt_set(ctx, "profile", "baseline", child)
 		ffmpeg.av_opt_set(ctx, "realtime", "1", child)
 		ffmpeg.av_opt_set(ctx, "allow_sw", "1", child)
 		ffmpeg.av_opt_set(ctx, "prio_speed", "1", child)
 	case "h264_mf":
 		ffmpeg.av_opt_set(ctx, "rate_control", "cbr", child)
 		ffmpeg.av_opt_set(ctx, "scenario", "display_remoting", child)
+		// Media Foundation cannot be asked for a keyframe; a short GOP bounds
+		// how long a new viewer waits for one.
+		ffmpeg.av_opt_set_int(ctx, "g", i64(fps), 0)
 	case "libx264":
+		ffmpeg.av_opt_set(ctx, "profile", "baseline", child)
 		ffmpeg.av_opt_set(ctx, "preset", "ultrafast", child)
 		ffmpeg.av_opt_set(ctx, "tune", "zerolatency", child)
 		ffmpeg.av_opt_set(ctx, "coder", "cavlc", child)

@@ -14,7 +14,7 @@ env:
 
 jobs:
   windows:
-    name: Windows
+    name: Windows (vendored FFmpeg 8)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,10 +26,11 @@ jobs:
         run: .\build.ps1
       - name: Unit tests
         run: .\build.ps1 test
-      - name: Smoke test
+      - name: Self-test (encoders against the linked FFmpeg)
         run: |
           .\build\odysseus.exe -version
           .\build\odysseus.exe -list-encoders
+          .\build\odysseus.exe -self-test
       - name: Type-check all targets
         run: .\build.ps1 check
 
@@ -64,10 +65,11 @@ jobs:
         run: ./build.sh
       - name: Unit tests
         run: ./build.sh test
-      - name: Smoke test
+      - name: Self-test (encoders against the linked FFmpeg)
         run: |
           ./build/odysseus -version
           ./build/odysseus -list-encoders
+          ./build/odysseus -self-test
       - name: End-to-end (X11 capture, software encode, headless Chrome)
         env:
           E2E_XVFB: "1"
@@ -83,8 +85,38 @@ jobs:
           pactl set-default-sink ci
           bash tests/e2e/run.sh -s 6 -a
 
+  linux-ffmpeg7:
+    name: Linux (Debian 13, FFmpeg 7)
+    runs-on: ubuntu-24.04
+    container: debian:trixie
+    steps:
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            sudo git ca-certificates curl xz-utils \
+            clang llvm make pkg-config cmake libssl-dev \
+            ffmpeg libavcodec-dev libavformat-dev libavdevice-dev libavutil-dev libswscale-dev \
+            libpipewire-0.3-dev libglib2.0-dev
+      - uses: actions/checkout@v4
+      - uses: laytan/setup-odin@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          release: ${{ env.ODIN_RELEASE }}
+      - name: Build libdatachannel
+        run: bash scripts/fetch-libs.sh
+      - name: Build
+        run: ./build.sh
+      - name: Unit tests
+        run: ./build.sh test
+      - name: Self-test (encoders against the linked FFmpeg)
+        run: |
+          ./build/odysseus -version
+          ./build/odysseus -list-encoders
+          ./build/odysseus -self-test
+
   macos:
-    name: macOS
+    name: macOS (Homebrew FFmpeg)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -103,8 +135,9 @@ jobs:
         run: ./build.sh
       - name: Unit tests
         run: ./build.sh test
-      - name: Smoke test
+      - name: Self-test (encoders against the linked FFmpeg)
         run: |
           ./build/odysseus -version
           ./build/odysseus -list-monitors
           ./build/odysseus -list-encoders
+          ./build/odysseus -self-test
