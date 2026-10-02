@@ -127,6 +127,49 @@ const STATS_JS = `(async () => {
   return out;
 })()`;
 
+// Starts the browser and waits for its DevTools endpoint. A cold start on a
+// busy CI runner can take a while, and occasionally the first launch never
+// comes up at all, so it gets a generous wait and one relaunch.
+async function launchBrowser(browser) {
+  let lastError = "";
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const profile = mkdtempSync(join(tmpdir(), "odysseus-e2e-"));
+    const port = 9300 + Math.floor(Math.random() * 500);
+    const child = spawn(browser, [
+      "--headless=new",
+      `--remote-debugging-port=${port}`,
+      `--user-data-dir=${profile}`,
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--disable-extensions",
+      "--mute-audio",
+      "--autoplay-policy=no-user-gesture-required",
+      "--window-size=1280,720",
+      // E2E_BROWSER_ARGS: extra flags, e.g. "--no-sandbox" on CI runners.
+      ...(process.env.E2E_BROWSER_ARGS ? process.env.E2E_BROWSER_ARGS.split(" ").filter(Boolean) : []),
+      "about:blank",
+    ], { stdio: ["ignore", "ignore", "pipe"] });
+    let stderr = "";
+    child.stderr.on("data", (chunk) => { stderr = (stderr + chunk).slice(-2000); });
+    let exited = false;
+    child.on("exit", () => { exited = true; });
+
+    for (let i = 0; i < 150 && !exited; i++) {
+      try {
+        await (await fetch(`http://127.0.0.1:${port}/json/version`)).json();
+        return { child, port, profile };
+      } catch {
+        await sleep(200);
+      }
+    }
+    child.kill();
+    try { rmSync(profile, { recursive: true, force: true }); } catch {}
+    lastError = stderr.trim();
+    console.error(`browser launch attempt ${attempt} failed${exited ? " (it exited)" : " (no DevTools endpoint after 30 s)"}`);
+  }
+  throw new Error(`browser did not expose a DevTools endpoint. Its last output:\n${lastError || "(none)"}`);
+}
+
 async function main() {
   const args = parseArgs(process.argv);
   const browser = findBrowser();
@@ -134,35 +177,15 @@ async function main() {
     console.error("no Chromium-based browser found; set BROWSER=/path/to/chrome");
     process.exit(2);
   }
-  const profile = mkdtempSync(join(tmpdir(), "odysseus-e2e-"));
-  const port = 9300 + Math.floor(Math.random() * 500);
-  const child = spawn(browser, [
-    "--headless=new",
-    `--remote-debugging-port=${port}`,
-    `--user-data-dir=${profile}`,
-    "--no-first-run",
-    "--no-default-browser-check",
-    "--disable-extensions",
-    "--mute-audio",
-    "--autoplay-policy=no-user-gesture-required",
-    "--window-size=1280,720",
-    // E2E_BROWSER_ARGS: extra flags, e.g. "--no-sandbox" on CI runners.
-    ...(process.env.E2E_BROWSER_ARGS ? process.env.E2E_BROWSER_ARGS.split(" ").filter(Boolean) : []),
-    "about:blank",
-  ], { stdio: "ignore" });
-
   let code = 1;
+  let child = null;
+  let profile = null;
   const pages = [];
   try {
-    let version = null;
-    for (let i = 0; i < 50 && !version; i++) {
-      try {
-        version = await (await fetch(`http://127.0.0.1:${port}/json/version`)).json();
-      } catch {
-        await sleep(200);
-      }
-    }
-    if (!version) throw new Error("browser did not expose a DevTools endpoint");
+    const launched = await launchBrowser(browser);
+    child = launched.child;
+    profile = launched.profile;
+    const port = launched.port;
 
     for (let i = 0; i < args.viewers; i++) {
       const target = await (await fetch(`http://127.0.0.1:${port}/json/new?about:blank`, { method: "PUT" })).json();
@@ -222,9 +245,11 @@ async function main() {
     code = 2;
   } finally {
     for (const cdp of pages) cdp.close();
-    child.kill();
+    if (child) child.kill();
     await sleep(500);
-    try { rmSync(profile, { recursive: true, force: true }); } catch {}
+    if (profile) {
+      try { rmSync(profile, { recursive: true, force: true }); } catch {}
+    }
   }
   process.exit(code);
 }
