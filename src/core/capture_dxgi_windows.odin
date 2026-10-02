@@ -238,6 +238,8 @@ capture_frame_dxgi :: proc(cap: ^Capture, out: ^Frame) -> Capture_Error {
 	if hr == dxgi.ERROR_WAIT_TIMEOUT {
 		if impl.have_frame {
 			capture_dxgi_fill(impl, out)
+		} else {
+			out^ = {}
 		}
 		return .Timeout
 	}
@@ -494,13 +496,19 @@ cursor_bits_from_bitmap :: proc(
 		impl.cursor_shape = make([]byte, needed)
 	}
 
-	bmi: win32.BITMAPINFO
-	bmi.bmiHeader.biSize = size_of(win32.BITMAPINFOHEADER)
-	bmi.bmiHeader.biWidth = i32(w)
-	bmi.bmiHeader.biHeight = -i32(h)
-	bmi.bmiHeader.biPlanes = 1
-	bmi.bmiHeader.biBitCount = bpp
-	bmi.bmiHeader.biCompression = win32.BI_RGB
+	// GetDIBits writes the colour table after the header: two entries for a
+	// 1 bpp bitmap, one more than BITMAPINFO declares.
+	Bitmap_Info :: struct {
+		header: win32.BITMAPINFOHEADER,
+		colors: [2]win32.RGBQUAD,
+	}
+	bmi: Bitmap_Info
+	bmi.header.biSize = size_of(win32.BITMAPINFOHEADER)
+	bmi.header.biWidth = i32(w)
+	bmi.header.biHeight = -i32(h)
+	bmi.header.biPlanes = 1
+	bmi.header.biBitCount = bpp
+	bmi.header.biCompression = win32.BI_RGB
 
 	got := win32.GetDIBits(
 		hdc,
@@ -508,7 +516,7 @@ cursor_bits_from_bitmap :: proc(
 		0,
 		u32(h),
 		raw_data(impl.cursor_shape),
-		&bmi,
+		(^win32.BITMAPINFO)(&bmi),
 		win32.DIB_RGB_COLORS,
 	)
 	if got == 0 {

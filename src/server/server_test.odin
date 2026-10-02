@@ -237,6 +237,71 @@ test_header_value_last_line_without_crlf :: proc(t: ^testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// json_depth_ok
+
+@(private = "file")
+depth_ok :: proc(text: string) -> bool {
+	return json_depth_ok(transmute([]byte)text, JSON_MAX_DEPTH)
+}
+
+@(test)
+test_json_depth_flat_messages_pass :: proc(t: ^testing.T) {
+	testing.expect(t, depth_ok(`{"type":"offer","sdp":"v=0"}`))
+	testing.expect(t, depth_ok(`{"type":"input","ev":"move","x":0.5,"y":0.25}`))
+	testing.expect(t, depth_ok(`{"a":[[1,2],[3]]}`), "depth 3")
+	testing.expect(t, depth_ok(``))
+}
+
+@(test)
+test_json_depth_brackets_in_strings_do_not_count :: proc(t: ^testing.T) {
+	testing.expect(t, depth_ok(`{"sdp":"[[[[[[[[{{{{{{"}`))
+	// An escaped quote does not end the string...
+	testing.expect(t, depth_ok("{\"sdp\":\"a\\\"[[[[[[[[\"}"))
+	// ...and an escaped backslash does not escape the quote after it.
+	testing.expect(t, !depth_ok("{\"a\":\"x\\\\\",\"b\":[[[[[1]]]]]}"))
+}
+
+@(test)
+test_json_depth_deep_nesting_is_refused :: proc(t: ^testing.T) {
+	testing.expect(t, !depth_ok(`[[[[[1]]]]]`), "depth 5")
+	testing.expect(t, !depth_ok(`{"a":{"a":{"a":{"a":{"a":1}}}}}`))
+	// What an attacker would send: nothing but opening brackets.
+	deep := make([]byte, 200_000, context.temp_allocator)
+	for &b in deep {
+		b = '['
+	}
+	testing.expect(t, !json_depth_ok(deep, JSON_MAX_DEPTH))
+}
+
+// ---------------------------------------------------------------------------
+// per-address connection accounting
+
+@(test)
+test_address_connection_cap :: proc(t: ^testing.T) {
+	a := net.Address(net.IP4_Address{10, 0, 0, 1})
+	b := net.Address(net.IP4_Address{10, 0, 0, 2})
+	saved := srv.per_address
+	srv.per_address = {}
+	defer {
+		delete(srv.per_address)
+		srv.per_address = saved
+	}
+
+	for _ in 0 ..< MAX_CONNECTIONS_PER_ADDRESS {
+		testing.expect(t, address_acquire(a))
+	}
+	testing.expect(t, !address_acquire(a), "one address cannot take more than its share")
+	testing.expect(t, address_acquire(b), "another address is unaffected")
+	address_release(a)
+	testing.expect(t, address_acquire(a), "a released slot can be taken again")
+	for _ in 0 ..< MAX_CONNECTIONS_PER_ADDRESS {
+		address_release(a)
+	}
+	address_release(b)
+	testing.expect_value(t, len(srv.per_address), 0)
+}
+
+// ---------------------------------------------------------------------------
 // host_allowed
 
 @(test)

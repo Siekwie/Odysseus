@@ -24,6 +24,7 @@ Client :: struct {
 	authorized:    bool, // may watch
 	control:       bool, // may send input
 	auth_failures: int,
+	dead:          bool, // a write failed; the socket is being torn down (under mu)
 }
 
 Hooks :: struct {
@@ -40,9 +41,10 @@ Server :: struct {
 	max_http: int,
 	host_names:   string, // -host-name: extra names accepted in the Host header (comma separated)
 	machine_name: string,
-	mu:       sync.Mutex, // clients, connections
+	mu:       sync.Mutex, // clients, connections, per_address
 	clients:  [dynamic]^Client,
 	connections: int,
+	per_address: [dynamic]Address_Count,
 	listener: net.TCP_Socket,
 	stopping: bool,
 }
@@ -59,7 +61,22 @@ WS_IDLE_TIMEOUT     :: 20 * time.Second // ping after this much silence
 @(private)
 WS_IDLE_LIMIT       :: 3                // unanswered pings before the client is dropped
 @(private)
-WS_SEND_TIMEOUT     :: 10 * time.Second
+WS_SEND_TIMEOUT     :: 5 * time.Second
+// One address cannot take every connection slot.
+@(private)
+MAX_CONNECTIONS_PER_ADDRESS :: 16
+// A signaling socket that has not authenticated by then is dropped.
+@(private)
+WS_UNAUTHORIZED_LIMIT :: 2 * time.Minute
+// Signaling messages are flat JSON objects.
+@(private)
+JSON_MAX_DEPTH :: 4
+
+@(private)
+Address_Count :: struct {
+	address: net.Address,
+	count:   int,
+}
 
 // client_send marshals msg as JSON and sends it as one text frame.
 client_send :: proc(client: ^Client, msg: any) -> bool {
@@ -70,7 +87,26 @@ client_send :: proc(client: ^Client, msg: any) -> bool {
 	defer delete(data)
 	sync.lock(&client.mu)
 	defer sync.unlock(&client.mu)
-	return ws_write_text(client.sock, string(data))
+	if client.dead {
+		return false
+	}
+	if !ws_write_text(client.sock, string(data)) {
+		// A client that stopped reading (or a frame cut short by the send
+		// timeout) cannot be resynchronized. Shutting the socket down also
+		// makes every later write fail at once instead of blocking again.
+		client.dead = true
+		net.shutdown(client.sock, .Both)
+		return false
+	}
+	return true
+}
+
+// client_close drops a signaling client; its connection thread cleans up.
+client_close :: proc(client: ^Client) {
+	sync.lock(&client.mu)
+	client.dead = true
+	sync.unlock(&client.mu)
+	net.shutdown(client.sock, .Both)
 }
 
 client_send_error :: proc(client: ^Client, code, message: string) {
@@ -125,6 +161,9 @@ listen_and_serve :: proc(cfg: utils.Config, hooks: Hooks) -> net.Network_Error {
 		sync.lock(&srv.mu)
 		over := srv.max_http > 0 && srv.connections >= srv.max_http
 		if !over {
+			over = !address_acquire(remote.address)
+		}
+		if !over {
 			srv.connections += 1
 		}
 		sync.unlock(&srv.mu)
@@ -136,7 +175,7 @@ listen_and_serve :: proc(cfg: utils.Config, hooks: Hooks) -> net.Network_Error {
 
 		t := thread.create_and_start_with_poly_data2(conn, remote, handle_connection, self_cleanup = true)
 		if t == nil {
-			handle_connection_done(conn)
+			handle_connection_done(conn, remote)
 		}
 	}
 }
@@ -172,16 +211,79 @@ bind_to_address :: proc(bind: string) -> (net.Address, bool) {
 }
 
 @(private)
-handle_connection_done :: proc(sock: net.TCP_Socket) {
+handle_connection_done :: proc(sock: net.TCP_Socket, remote: net.Endpoint) {
 	net.close(sock)
 	sync.lock(&srv.mu)
 	srv.connections -= 1
+	address_release(remote.address)
 	sync.unlock(&srv.mu)
+}
+
+// Counts a connection from address; false when it already has its share. Caller holds srv.mu.
+@(private)
+address_acquire :: proc(address: net.Address) -> bool {
+	for &entry in srv.per_address {
+		if entry.address == address {
+			if entry.count >= MAX_CONNECTIONS_PER_ADDRESS {
+				return false
+			}
+			entry.count += 1
+			return true
+		}
+	}
+	append(&srv.per_address, Address_Count{address, 1})
+	return true
+}
+
+// Caller holds srv.mu.
+@(private)
+address_release :: proc(address: net.Address) {
+	for &entry, i in srv.per_address {
+		if entry.address == address {
+			entry.count -= 1
+			if entry.count <= 0 {
+				unordered_remove(&srv.per_address, i)
+			}
+			return
+		}
+	}
+}
+
+// json_depth_ok reports whether the nesting of objects and arrays in a JSON
+// text stays within limit. The JSON parser recurses per level without a
+// bound, so a message of nothing but brackets would overflow the stack.
+@(private)
+json_depth_ok :: proc(data: []byte, limit: int) -> bool {
+	depth := 0
+	in_string := false
+	escaped := false
+	for b in data {
+		if in_string {
+			switch {
+			case escaped:   escaped = false
+			case b == '\\': escaped = true
+			case b == '"':  in_string = false
+			}
+			continue
+		}
+		switch b {
+		case '"':
+			in_string = true
+		case '{', '[':
+			depth += 1
+			if depth > limit {
+				return false
+			}
+		case '}', ']':
+			depth -= 1
+		}
+	}
+	return true
 }
 
 @(private)
 handle_connection :: proc(sock: net.TCP_Socket, remote: net.Endpoint) {
-	defer handle_connection_done(sock)
+	defer handle_connection_done(sock, remote)
 	defer free_all(context.temp_allocator)
 
 	net.set_option(sock, .Receive_Timeout, HTTP_HEAD_TIMEOUT)
@@ -401,9 +503,14 @@ serve_signal :: proc(sock: net.TCP_Socket, remote: net.Endpoint, req: Request) {
 	defer delete(message)
 	defer delete(frame)
 	idle := 0
+	opened := time.tick_now()
 
 	read_loop: for {
 		free_all(context.temp_allocator)
+		if !client.authorized && time.tick_since(opened) > WS_UNAUTHORIZED_LIMIT {
+			utils.log_debug("signaling client did not authenticate in time")
+			break read_loop
+		}
 		switch ws_read_text(sock, &message, &frame, &client.mu) {
 		case .Closed:
 			break read_loop
@@ -428,7 +535,8 @@ serve_signal :: proc(sock: net.TCP_Socket, remote: net.Endpoint, req: Request) {
 		}
 
 		msg: network.Signal_Message
-		if json.unmarshal(message[:], &msg, allocator = context.temp_allocator) != nil {
+		if !json_depth_ok(message[:], JSON_MAX_DEPTH) ||
+		   json.unmarshal(message[:], &msg, allocator = context.temp_allocator) != nil {
 			utils.log_debug("ignoring malformed signaling message")
 			continue
 		}

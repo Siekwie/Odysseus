@@ -1,8 +1,10 @@
 package main
 
 import "core:crypto"
+import "core:crypto/hash"
 import "core:encoding/json"
 import "core:net"
+import "core:sync"
 import "core:thread"
 import "core:time"
 
@@ -32,9 +34,8 @@ on_client_close :: proc(user: rawptr, client: ^server.Client) {
 		// A viewer that vanishes mid-keystroke must not leave keys held on the host.
 		input.release_all()
 	}
-	if stream.session_remove_viewer(&app.session, client) == 0 {
-		stream.session_stop(&app.session)
-	}
+	stream.session_remove_viewer(&app.session, client)
+	stream.session_stop_if_idle(&app.session)
 }
 
 on_client_message :: proc(user: rawptr, client: ^server.Client, msg: ^network.Signal_Message) {
@@ -51,7 +52,7 @@ on_client_message :: proc(user: rawptr, client: ^server.Client, msg: ^network.Si
 	case "offer":
 		handle_offer(client, msg.sdp)
 	case "candidate":
-		stream.session_add_ice(&app.session, client, msg.candidate, msg.mid, app.cfg.max_viewers)
+		stream.session_add_ice(&app.session, client, msg.candidate, msg.mid)
 	case "keyframe", "viewer-ready":
 		stream.session_request_keyframe(&app.session)
 	case "monitor":
@@ -65,6 +66,10 @@ on_client_message :: proc(user: rawptr, client: ^server.Client, msg: ^network.Si
 
 // GET /api/status
 on_status :: proc(user: rawptr, allocator := context.allocator) -> string {
+	if app.cfg.password != "" {
+		// What is being streamed is not public when viewing needs a password.
+		return `{"locked":true}`
+	}
 	data, err := json.marshal(state_message(), allocator = allocator)
 	if err != nil {
 		return "{}"
@@ -138,12 +143,98 @@ send_hello :: proc(client: ^server.Client) {
 	server.client_send(client, hello)
 }
 
+// Compares digests so that neither the content nor the length of the secret
+// shows in the timing.
 @(private)
 secret_matches :: proc(given, secret: string) -> bool {
-	if secret == "" || len(given) != len(secret) {
+	if secret == "" {
 		return false
 	}
-	return crypto.compare_constant_time(transmute([]byte)given, transmute([]byte)secret) == 1
+	a, b: [32]byte
+	hash.hash_string_to_buffer(.SHA256, given, a[:])
+	hash.hash_string_to_buffer(.SHA256, secret, b[:])
+	return crypto.compare_constant_time(a[:], b[:]) == 1
+}
+
+// Failed attempts are counted per address, across connections: reconnecting
+// does not buy more guesses. After AUTH_FAILURE_LIMIT failures the address is
+// locked out, for longer each time.
+@(private)
+Auth_Record :: struct {
+	address:       net.Address,
+	failures:      int,
+	lockouts:      int,
+	blocked_until: time.Tick,
+	last:          time.Tick,
+}
+
+@(private)
+auth_mu: sync.Mutex
+@(private)
+auth_records: [dynamic]Auth_Record
+
+@(private)
+AUTH_RECORD_LIMIT :: 256
+@(private)
+AUTH_LOCKOUT :: 30 * time.Second
+@(private)
+AUTH_LOCKOUT_MAX :: time.Hour
+
+// Caller holds auth_mu. Returns nil when the table is full of other addresses.
+@(private)
+auth_record :: proc(address: net.Address, create: bool) -> ^Auth_Record {
+	oldest := -1
+	for &r, i in auth_records {
+		if r.address == address {
+			return &r
+		}
+		if oldest < 0 || time.tick_diff(r.last, auth_records[oldest].last) > 0 {
+			oldest = i
+		}
+	}
+	if !create {
+		return nil
+	}
+	if len(auth_records) >= AUTH_RECORD_LIMIT {
+		// Recycle the record that has been quiet the longest.
+		auth_records[oldest] = {address = address}
+		return &auth_records[oldest]
+	}
+	append(&auth_records, Auth_Record{address = address})
+	return &auth_records[len(auth_records) - 1]
+}
+
+@(private)
+auth_locked_out :: proc(address: net.Address) -> bool {
+	sync.guard(&auth_mu)
+	r := auth_record(address, false)
+	return r != nil && time.tick_diff(time.tick_now(), r.blocked_until) > 0
+}
+
+@(private)
+auth_note_failure :: proc(address: net.Address) {
+	sync.guard(&auth_mu)
+	r := auth_record(address, true)
+	if r == nil {
+		return
+	}
+	now := time.tick_now()
+	r.last = now
+	r.failures += 1
+	if r.failures >= AUTH_FAILURE_LIMIT {
+		r.failures = 0
+		lockout := AUTH_LOCKOUT << uint(min(r.lockouts, 7))
+		r.lockouts += 1
+		r.blocked_until = time.tick_add(now, min(lockout, AUTH_LOCKOUT_MAX))
+	}
+}
+
+@(private)
+auth_note_success :: proc(address: net.Address) {
+	sync.guard(&auth_mu)
+	if r := auth_record(address, false); r != nil {
+		r^ = {address = address}
+	}
 }
 
 // "auth" carries the viewing password, which also unlocks remote control, or
@@ -151,6 +242,13 @@ secret_matches :: proc(given, secret: string) -> bool {
 @(private)
 handle_auth :: proc(client: ^server.Client, given: string) {
 	cfg := &app.cfg
+	address := client.remote.address
+	if auth_locked_out(address) {
+		server.client_send_error(client, "auth", "too many wrong attempts; try again later")
+		server.client_close(client)
+		return
+	}
+
 	ok := false
 	switch {
 	case cfg.password != "":
@@ -169,15 +267,17 @@ handle_auth :: proc(client: ^server.Client, given: string) {
 	}
 
 	if !ok {
+		auth_note_failure(address)
 		client.auth_failures += 1
-		utils.log_warn("failed auth attempt from %s", net.address_to_string(client.remote.address, context.temp_allocator))
+		utils.log_warn("failed auth attempt from %s", net.address_to_string(address, context.temp_allocator))
 		time.sleep(AUTH_FAILURE_DELAY) // slows guessing down
 		server.client_send_error(client, "auth", "wrong password")
-		if client.auth_failures >= AUTH_FAILURE_LIMIT {
-			net.shutdown(client.sock, .Both)
+		if client.auth_failures >= AUTH_FAILURE_LIMIT || auth_locked_out(address) {
+			server.client_close(client)
 		}
 		return
 	}
+	auth_note_success(address)
 	send_hello(client)
 }
 
@@ -190,17 +290,10 @@ handle_input :: proc(client: ^server.Client, msg: ^network.Signal_Message) {
 	if !ok {
 		return
 	}
-	monitor, found := core.monitor_by_index(stream.session_monitor(&app.session))
-	if !found {
-		return
+	// The geometry is cached by the session: this runs for every pointer move.
+	if target, streaming := stream.session_input_target(&app.session); streaming {
+		input.inject(event, target)
 	}
-	if monitor.width <= 0 || monitor.height <= 0 {
-		// No display enumeration (Wayland portal): the captured stream is the monitor.
-		info := stream.session_info(&app.session)
-		monitor.width = info.source_width
-		monitor.height = info.source_height
-	}
-	input.inject(event, monitor)
 }
 
 @(private)
@@ -222,13 +315,13 @@ handle_offer :: proc(client: ^server.Client, sdp: string) {
 	case .Ok:
 	case .Denied:
 		server.client_send_error(client, "denied", "the host is not sharing its screen")
-		stop_if_empty()
 		return
 	case .Failed:
 		server.client_send_error(client, "capture", "the host could not start screen capture")
-		stop_if_empty()
 		return
 	}
+	// From here on the session is reserved for this viewer: every way out
+	// either attaches the peer or gives the reservation back.
 
 	peer, err := network.peer_create({
 		bind_address = cfg.bind,
@@ -243,7 +336,7 @@ handle_offer :: proc(client: ^server.Client, sdp: string) {
 	if err != .None {
 		utils.log_error("could not create a peer connection: %v", err)
 		server.client_send_error(client, "peer", "the host could not create a WebRTC connection")
-		stop_if_empty()
+		abandon_join()
 		return
 	}
 	peer.user = client
@@ -255,29 +348,29 @@ handle_offer :: proc(client: ^server.Client, sdp: string) {
 	if !network.peer_set_remote_offer(peer, sdp) {
 		network.peer_close(peer)
 		server.client_send_error(client, "peer", "the host rejected the offer")
-		stop_if_empty()
+		abandon_join()
 		return
 	}
 
-	pending, attached := stream.session_attach_peer(session, client, peer, cfg.max_viewers)
-	if !attached {
+	switch stream.session_attach_peer(session, client, peer, cfg.max_viewers) {
+	case .Ok:
+	case .Full:
 		network.peer_close(peer)
 		server.client_send_error(client, "busy", "too many viewers")
-		return
+	case .Not_Running:
+		// The session ended while this viewer was joining (the host stopped
+		// the share, or shutdown). The viewer retries and gets the real reason.
+		network.peer_close(peer)
+		server.client_send_error(client, "capture", "the stream ended while connecting")
 	}
-	for p in pending {
-		network.peer_add_ice_candidate(peer, p.candidate, p.mid)
-		delete(p.candidate)
-		delete(p.mid)
-	}
-	delete(pending)
 }
 
+// Gives back the reservation of a join that failed and stops the pipeline if
+// that leaves nobody.
 @(private)
-stop_if_empty :: proc() {
-	if stream.session_viewer_count(&app.session) == 0 {
-		stream.session_stop(&app.session)
-	}
+abandon_join :: proc() {
+	stream.session_join_abort(&app.session)
+	stream.session_stop_if_idle(&app.session)
 }
 
 // libdatachannel threads below.

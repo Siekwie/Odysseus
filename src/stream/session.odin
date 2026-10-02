@@ -15,15 +15,9 @@ import "../utils"
 // The pipeline lives entirely on the session thread; other threads only flip
 // flags (keyframe, monitor switch) and manage the viewer list.
 
-Pending_Ice :: struct {
-	candidate: string,
-	mid:       string,
-}
-
 Viewer :: struct {
-	key:     rawptr, // signaling client that owns this viewer
-	peer:    ^network.Peer,
-	pending: [dynamic]Pending_Ice, // candidates that arrived before the offer
+	key:  rawptr, // signaling client that owns this viewer
+	peer: ^network.Peer,
 }
 
 // Stream_Info describes what is currently being streamed.
@@ -33,6 +27,8 @@ Stream_Info :: struct {
 	height:  int,
 	source_width:  int, // captured size
 	source_height: int,
+	monitor_x:     int, // position of the captured monitor on the virtual desktop
+	monitor_y:     int,
 	fps:     int,
 	encoder: string, // static or session-owned; valid until the next pipeline restart
 	capture: string,
@@ -56,6 +52,9 @@ Session :: struct {
 	start_mu: sync.Mutex, // serializes session_start / session_stop
 	started:  sync.Sema,  // posted by the loop once the pipeline is open (or failed)
 	start_ok: bool,
+
+	joining:  int,  // callers between session_start and attach / abort (under mu)
+	stopping: bool, // process is shutting down (under mu)
 
 	monitor:    int,       // monitor the pipeline should capture
 	restart:    bool,      // atomic: reopen the pipeline
@@ -101,12 +100,21 @@ session_init :: proc(
 // session_start makes sure the pipeline is running. It blocks until the
 // capture and encoder are open (which can include the host answering a
 // screen-share dialog).
+//
+// A successful call reserves the session for the caller: it will not be
+// stopped for being empty until the caller either attaches its peer
+// (session_attach_peer) or gives up (session_join_abort).
 session_start :: proc(s: ^Session) -> Start_Result {
 	sync.lock(&s.start_mu)
 	defer sync.unlock(&s.start_mu)
 
 	sync.lock(&s.mu)
+	if s.stopping {
+		sync.unlock(&s.mu)
+		return .Failed
+	}
 	if s.running {
+		s.joining += 1
 		sync.unlock(&s.mu)
 		return .Ok
 	}
@@ -149,18 +157,55 @@ session_start :: proc(s: ^Session) -> Start_Result {
 
 	if s.cfg.audio {
 		s.audio = audio.start({device = s.cfg.audio_device, bitrate_kbps = s.cfg.audio_bitrate}, session_audio_packet, s)
-		sync.lock(&s.mu)
-		s.info.audio = s.audio != nil
-		sync.unlock(&s.mu)
 	}
+	sync.lock(&s.mu)
+	s.info.audio = s.audio != nil
+	s.joining += 1
+	sync.unlock(&s.mu)
 	return .Ok
+}
+
+// session_join_abort gives up a reservation made by session_start.
+session_join_abort :: proc(s: ^Session) {
+	sync.lock(&s.mu)
+	s.joining = max(s.joining - 1, 0)
+	sync.unlock(&s.mu)
 }
 
 // session_stop ends the pipeline and disconnects every viewer.
 session_stop :: proc(s: ^Session) {
 	sync.lock(&s.start_mu)
 	defer sync.unlock(&s.start_mu)
+	stop_locked(s)
+}
 
+// session_stop_if_idle stops the pipeline when nobody is watching and nobody
+// is in the middle of joining. The check and the stop are one step, so a
+// viewer that is just connecting cannot end up attached to a stopped session.
+session_stop_if_idle :: proc(s: ^Session) {
+	sync.lock(&s.start_mu)
+	defer sync.unlock(&s.start_mu)
+
+	sync.shared_lock(&s.mu)
+	idle := len(s.viewers) == 0 && s.joining == 0
+	sync.shared_unlock(&s.mu)
+	// start_mu keeps new joiners out between the check and the stop.
+	if idle {
+		stop_locked(s)
+	}
+}
+
+// session_shutdown stops the session for good; later session_start calls fail.
+session_shutdown :: proc(s: ^Session) {
+	sync.lock(&s.mu)
+	s.stopping = true
+	sync.unlock(&s.mu)
+	session_stop(s)
+}
+
+// Caller holds start_mu.
+@(private)
+stop_locked :: proc(s: ^Session) {
 	if s.audio != nil {
 		audio.stop(s.audio)
 		s.audio = nil
@@ -193,10 +238,13 @@ session_audio_available :: proc(s: ^Session) -> bool {
 	return s.info.audio
 }
 
+// session_info returns a snapshot; its strings are temp-allocated copies.
 session_info :: proc(s: ^Session) -> Stream_Info {
 	sync.shared_lock(&s.mu)
 	defer sync.shared_unlock(&s.mu)
-	return s.info
+	info := s.info
+	info.encoder = strings.clone(s.info.encoder, context.temp_allocator)
+	return info
 }
 
 // session_video_fmtp builds the H.264 fmtp of the SDP answer for the running encoder.
@@ -218,18 +266,28 @@ session_has_viewer :: proc(s: ^Session, key: rawptr) -> bool {
 	return viewer_index(s, key) >= 0
 }
 
+Attach_Result :: enum {
+	Ok,
+	Full,        // max_viewers reached
+	Not_Running, // the session stopped (host ended the share, shutdown) since session_start
+}
+
 // session_attach_peer binds a peer to its signaling client, replacing the
-// client's previous peer. A new client is refused once max_viewers is reached.
-// The caller owns the returned ICE candidates that were queued before the offer.
-session_attach_peer :: proc(s: ^Session, key: rawptr, peer: ^network.Peer, max_viewers: int) -> (pending: [dynamic]Pending_Ice, ok: bool) {
+// client's previous peer, and ends the reservation made by session_start.
+session_attach_peer :: proc(s: ^Session, key: rawptr, peer: ^network.Peer, max_viewers: int) -> Attach_Result {
 	sync.lock(&s.mu)
+	s.joining = max(s.joining - 1, 0)
+	if !s.running {
+		sync.unlock(&s.mu)
+		return .Not_Running
+	}
 	v: ^Viewer
 	if i := viewer_index(s, key); i >= 0 {
 		v = s.viewers[i]
 	} else {
 		if max_viewers > 0 && len(s.viewers) >= max_viewers {
 			sync.unlock(&s.mu)
-			return {}, false
+			return .Full
 		}
 		v = new(Viewer)
 		v.key = key
@@ -237,8 +295,6 @@ session_attach_peer :: proc(s: ^Session, key: rawptr, peer: ^network.Peer, max_v
 	}
 	old := v.peer
 	v.peer = peer
-	pending = v.pending
-	v.pending = {}
 	count := len(s.viewers)
 	sync.unlock(&s.mu)
 
@@ -247,35 +303,30 @@ session_attach_peer :: proc(s: ^Session, key: rawptr, peer: ^network.Peer, max_v
 	}
 	utils.log_info("viewer connected (%d watching)", count)
 	notify(s)
-	return pending, true
+	return .Ok
 }
 
-// session_add_ice hands a remote candidate to the client's peer, or queues it
-// until the offer arrives.
-session_add_ice :: proc(s: ^Session, key: rawptr, candidate, mid: string, max_viewers: int) {
-	if candidate == "" {
-		return
-	}
-	sync.lock(&s.mu)
-	defer sync.unlock(&s.mu)
+// Longest ICE candidate line accepted from a viewer.
+@(private)
+MAX_CANDIDATE_LENGTH :: 1024
 
-	v: ^Viewer
-	if i := viewer_index(s, key); i >= 0 {
-		v = s.viewers[i]
-	} else {
-		if max_viewers > 0 && len(s.viewers) >= max_viewers {
-			return
-		}
-		v = new(Viewer)
-		v.key = key
-		append(&s.viewers, v)
-	}
-	if v.peer != nil {
-		network.peer_add_ice_candidate(v.peer, candidate, mid)
+// session_add_ice hands a remote candidate to the client's peer. Browsers
+// send candidates only after their offer, which the same connection thread
+// has already handled; a candidate without a peer belongs to a failed offer
+// and is dropped.
+session_add_ice :: proc(s: ^Session, key: rawptr, candidate, mid: string) {
+	if candidate == "" || len(candidate) > MAX_CANDIDATE_LENGTH || len(mid) > 64 {
 		return
 	}
-	if len(v.pending) < 64 {
-		append(&v.pending, Pending_Ice{strings.clone(candidate), strings.clone(mid)})
+	peer: ^network.Peer
+	sync.shared_lock(&s.mu)
+	if i := viewer_index(s, key); i >= 0 {
+		peer = s.viewers[i].peer
+	}
+	sync.shared_unlock(&s.mu)
+	// Outside the lock: libdatachannel may call back into the session.
+	if peer != nil {
+		network.peer_add_ice_candidate(peer, candidate, mid)
 	}
 }
 
@@ -291,11 +342,8 @@ session_remove_viewer :: proc(s: ^Session, key: rawptr) -> (remaining: int) {
 	sync.unlock(&s.mu)
 
 	if v != nil {
-		had_peer := v.peer != nil
 		viewer_destroy(v)
-		if had_peer {
-			utils.log_info("viewer disconnected (%d watching)", remaining)
-		}
+		utils.log_info("viewer disconnected (%d watching)", remaining)
 		notify(s)
 	}
 	return
@@ -342,6 +390,24 @@ session_set_monitor :: proc(s: ^Session, index: int) -> bool {
 	return true
 }
 
+// session_input_target describes the monitor being streamed, for mapping
+// remote input: its position on the virtual desktop and its size in pixels.
+// ok is false while nothing is streamed.
+session_input_target :: proc(s: ^Session) -> (target: core.Monitor_Info, ok: bool) {
+	sync.shared_lock(&s.mu)
+	defer sync.shared_unlock(&s.mu)
+	if !s.running || s.info.source_width <= 0 {
+		return {}, false
+	}
+	return {
+		index  = s.info.monitor,
+		x      = s.info.monitor_x,
+		y      = s.info.monitor_y,
+		width  = s.info.source_width,
+		height = s.info.source_height,
+	}, true
+}
+
 session_monitor :: proc(s: ^Session) -> int {
 	sync.shared_lock(&s.mu)
 	defer sync.shared_unlock(&s.mu)
@@ -368,11 +434,6 @@ viewer_index :: proc(s: ^Session, key: rawptr) -> int {
 @(private)
 viewer_destroy :: proc(v: ^Viewer) {
 	network.peer_close(v.peer)
-	for p in v.pending {
-		delete(p.candidate)
-		delete(p.mid)
-	}
-	delete(v.pending)
 	free(v)
 }
 
@@ -400,6 +461,7 @@ Pipeline :: struct {
 	bad:      [dynamic]string, // encoders that opened but then failed to encode
 	failures: int,             // consecutive encode errors
 	denied:   bool,            // the last open was refused by the host
+	reopened: time.Tick,       // when the pipeline was last reopened
 }
 
 @(private)
@@ -429,6 +491,7 @@ pipeline_open :: proc(s: ^Session, p: ^Pipeline) -> bool {
 		prefer_gpu = true,
 		input      = cfg.input,
 	}
+	requested_monitor := monitor
 	cap, cerr := core.capture_open(capture_opts)
 	if cerr == .No_Output && monitor != 0 {
 		utils.log_warn("monitor %d does not exist; capturing monitor 0", monitor)
@@ -488,12 +551,21 @@ pipeline_open :: proc(s: ^Session, p: ^Pipeline) -> bool {
 	p.enc = enc
 	p.failures = 0
 
+	// Looked up once per pipeline: input events are mapped through it.
+	geometry, _ := core.monitor_by_index(monitor)
+
 	sync.lock(&s.mu)
 	delete(s.headers)
 	s.headers = nil
 	n := copy(s.enc_name[:], core.encoder_name(enc))
-	s.monitor = monitor
+	if monitor != requested_monitor && s.monitor == requested_monitor {
+		// Fell back to monitor 0. A switch requested meanwhile stays in place
+		// (its restart flag is already set).
+		s.monitor = monitor
+	}
 	s.info.monitor = monitor
+	s.info.monitor_x = geometry.x
+	s.info.monitor_y = geometry.y
 	s.info.width = w
 	s.info.height = h
 	s.info.source_width = cap.width
@@ -512,8 +584,16 @@ pipeline_open :: proc(s: ^Session, p: ^Pipeline) -> bool {
 
 // Reopens the pipeline until it works or the session stops.
 @(private)
-pipeline_reopen :: proc(s: ^Session, p: ^Pipeline) -> bool {
+pipeline_reopen :: proc(s: ^Session, p: ^Pipeline, frame: ^core.Frame) -> bool {
+	// The frame's pixels (or texture) belong to the capture being closed.
+	frame^ = {}
 	pipeline_close(p)
+	// A capture that opens and is lost again at once (a display that keeps
+	// changing mode) must not turn this into a busy loop.
+	if time.tick_since(p.reopened) < time.Second {
+		time.sleep(250 * time.Millisecond)
+	}
+	p.reopened = time.tick_now()
 	delay := 100 * time.Millisecond
 	for session_running(s) {
 		if pipeline_open(s, p) {
@@ -555,7 +635,12 @@ session_running :: proc(s: ^Session) -> bool {
 @(private)
 session_loop :: proc(s: ^Session) {
 	pipe: Pipeline
-	defer delete(pipe.bad)
+	defer {
+		for name in pipe.bad {
+			delete(name)
+		}
+		delete(pipe.bad)
+	}
 
 	s.start_ok = pipeline_open(s, &pipe)
 	if !s.start_ok && pipe.denied {
@@ -586,7 +671,7 @@ session_loop :: proc(s: ^Session) {
 		free_all(context.temp_allocator)
 
 		if sync.atomic_exchange(&s.restart, false) {
-			if !pipeline_reopen(s, &pipe) {
+			if !pipeline_reopen(s, &pipe, &frame) {
 				break
 			}
 			next_frame_ns = core.now_ns()
@@ -628,7 +713,7 @@ session_loop :: proc(s: ^Session) {
 			return
 		case .Device_Lost:
 			utils.log_info("capture device lost (mode change or secure desktop); reopening")
-			if !pipeline_reopen(s, &pipe) {
+			if !pipeline_reopen(s, &pipe, &frame) {
 				return
 			}
 			capture_failures = 0
@@ -637,7 +722,7 @@ session_loop :: proc(s: ^Session) {
 			capture_failures += 1
 			if capture_failures >= 50 {
 				utils.log_warn("capture keeps failing (%v); reopening", cerr)
-				if !pipeline_reopen(s, &pipe) {
+				if !pipeline_reopen(s, &pipe, &frame) {
 					return
 				}
 				capture_failures = 0
@@ -661,7 +746,7 @@ session_loop :: proc(s: ^Session) {
 				name := strings.clone(core.encoder_name(pipe.enc))
 				utils.log_warn("encoder %s keeps failing (%v); switching encoder", name, eerr)
 				append(&pipe.bad, name)
-				if !pipeline_reopen(s, &pipe) {
+				if !pipeline_reopen(s, &pipe, &frame) {
 					return
 				}
 			}

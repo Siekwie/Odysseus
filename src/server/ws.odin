@@ -11,7 +11,7 @@ import "../utils"
 // Minimal RFC 6455 server side: text messages, fragmentation, ping/pong, close.
 
 WS_MAGIC       :: "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-WS_MAX_PAYLOAD :: 1 << 20
+WS_MAX_PAYLOAD :: 256 << 10 // an SDP offer is a few kilobytes
 
 WS_OP_CONTINUATION :: 0x0
 WS_OP_TEXT         :: 0x1

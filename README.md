@@ -179,11 +179,11 @@ once a second as a keepalive.
 over the machine, it is never open to everyone on the network:
 
 - with `-password:<text>`, the viewing password also unlocks control;
-- without one, Odysseus prints a six-digit PIN at startup and the viewer asks
-  for it when "Remote control" is switched on.
+- without one, Odysseus prints an eight-digit PIN at startup and the viewer
+  asks for it when "Remote control" is switched on.
 
-Five wrong attempts close the connection. Keys and buttons held by a viewer
-are released when that viewer disconnects.
+Five wrong attempts lock that address out, for longer each time. Keys and
+buttons held by a viewer are released when that viewer disconnects.
 
 On Wayland, remote control goes through the desktop's RemoteDesktop portal
 (GNOME and KDE have it; wlroots compositors do not).
@@ -201,6 +201,9 @@ Odysseus is meant for a network you trust.
   reaching an Odysseus host behind your back (cross-site WebSocket hijacking,
   DNS rebinding).
 - Anyone who can open the page can watch unless `-password` is set.
+- One address can hold at most 16 connections, and a connection that does not
+  authenticate within two minutes is dropped, so a single device cannot lock
+  everyone else out.
 
 ## Network notes
 

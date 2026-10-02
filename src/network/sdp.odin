@@ -141,7 +141,7 @@ parse_pt_attribute :: proc(line, prefix: string) -> (pt: int, rest: string, ok: 
 		return
 	}
 	pt, ok = strconv.parse_int(body[:sp], 10)
-	if !ok {
+	if !ok || pt < 0 || pt > 127 {
 		return 0, "", false
 	}
 	return pt, body[sp + 1:], true

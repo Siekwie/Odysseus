@@ -3,6 +3,7 @@ package main
 import "core:crypto"
 import "core:fmt"
 import "core:os"
+import "core:time"
 
 import "src/core"
 import "src/input"
@@ -85,13 +86,19 @@ main :: proc() {
 		utils.log_error("could not listen on port %d: %v", cfg.port, err)
 		os.exit(1)
 	}
+	// The accept loop only returns once shutdown has begun. on_shutdown is
+	// still tearing things down on its own thread and exits the process when
+	// done; returning from main here would cut that short.
+	for {
+		time.sleep(time.Second)
+	}
 }
 
 // Runs once when the process is asked to stop.
 on_shutdown :: proc() {
 	utils.log_info("shutting down")
 	server.shutdown()
-	stream.session_stop(&app.session)
+	stream.session_shutdown(&app.session)
 	if app.cfg.input {
 		input.shutdown()
 	}
@@ -103,8 +110,8 @@ on_shutdown :: proc() {
 generate_pin :: proc() -> string {
 	raw: [4]byte
 	crypto.rand_bytes(raw[:])
-	n := (u32(raw[0]) | u32(raw[1]) << 8 | u32(raw[2]) << 16 | u32(raw[3]) << 24) % 1_000_000
-	return fmt.aprintf("%06d", n)
+	n := (u32(raw[0]) | u32(raw[1]) << 8 | u32(raw[2]) << 16 | u32(raw[3]) << 24) % 100_000_000
+	return fmt.aprintf("%08d", n)
 }
 
 @(private)

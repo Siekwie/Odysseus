@@ -105,7 +105,9 @@ static void dbg(const char *fmt, ...)
 	va_list ap;
 
 	if (enabled < 0) {
-		enabled = g_getenv("ODYSSEUS_PW_DEBUG") != NULL;
+		const char *v = g_getenv("ODYSSEUS_PW_DEBUG");
+
+		enabled = v != NULL && v[0] != '\0' && v[0] != '0';
 	}
 	if (!enabled) {
 		return;

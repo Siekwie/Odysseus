@@ -630,17 +630,32 @@ test_parse_many_h264_payloads_best_one_late :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_parse_exactly_16_h264_payloads :: proc(t: ^testing.T) {
+test_parse_as_many_h264_payloads_as_fit :: proc(t: ^testing.T) {
+	// The last slot of the table is the only usable (mode-1) payload.
+	FIRST :: 30
 	b := strings.builder_make(context.temp_allocator)
 	strings.write_string(&b, "m=video 9 RTP/AVP\na=mid:0\n")
 	for i in 0 ..< MAX_H264_PAYLOADS {
-		pt := 100 + i
+		pt := FIRST + i
 		pm := 1 if i == MAX_H264_PAYLOADS - 1 else 0
 		fmt.sbprintf(&b, "a=rtpmap:%d H264/90000\na=fmtp:%d packetization-mode=%d;profile-level-id=42e01f\n", pt, pt, pm)
 	}
 	info := parse_offer(strings.to_string(b))
-	// The last of the 16 is the only mode-1 payload.
-	expect_media(t, info.video, true, "0", 100 + MAX_H264_PAYLOADS - 1)
+	expect_media(t, info.video, true, "0", FIRST + MAX_H264_PAYLOADS - 1)
+}
+
+@(test)
+test_parse_payload_type_out_of_range :: proc(t: ^testing.T) {
+	// RTP payload types are 7 bits; anything else cannot be answered.
+	info := parse_offer(crlf(`m=video 9 RTP/AVP 200 96
+a=mid:0
+a=rtpmap:200 H264/90000
+a=fmtp:200 packetization-mode=1;profile-level-id=42e01f
+a=rtpmap:-3 H264/90000
+a=rtpmap:96 H264/90000
+a=fmtp:96 packetization-mode=1;profile-level-id=640c1f
+`))
+	expect_media(t, info.video, true, "0", 96)
 }
 
 @(test)
