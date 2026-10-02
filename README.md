@@ -35,7 +35,7 @@ devices that can reach each other on the same network connect directly.
 | **Windows 10/11** | Desktop Duplication (DXGI), GDI fallback | NVENC, AMF, Quick Sync, Media Foundation | WASAPI loopback | `SendInput` | Tested end to end |
 | **Linux, X11** | FFmpeg `x11grab` | NVENC, VAAPI, Quick Sync | PulseAudio / PipeWire-Pulse monitor | XTest | Tested end to end |
 | **Linux, Wayland** | xdg-desktop-portal + PipeWire | NVENC, VAAPI, Quick Sync | PulseAudio / PipeWire-Pulse monitor | RemoteDesktop portal (GNOME, KDE) | Capture tested on wlroots (sway); portal input untested |
-| **macOS 12.3+** | AVFoundation (default), ScreenCaptureKit (`-capture:screencapturekit`) | VideoToolbox | ScreenCaptureKit system audio (macOS 13+) | CoreGraphics events | Builds in CI; not yet run on real hardware |
+| **macOS 12.3+** | AVFoundation (default), ScreenCaptureKit (`-capture:screencapturekit`) | VideoToolbox | ScreenCaptureKit system audio (macOS 13+) | CoreGraphics events | Build, unit tests and encoder self-test pass in CI; capture, audio and input not yet run on real hardware |
 
 On Linux, Intel and AMD GPUs encode through VAAPI (needs FFmpeg 8 or 9 on
 x86-64). That path shares its code with a CUDA-pool variant that is tested,
@@ -259,8 +259,9 @@ actually decoded.
 
 FFmpeg's struct layouts differ between releases. The bindings in
 `vendor/ffmpeg` therefore configure codecs through AVOptions only and keep the
-few unavoidable offsets in `vendor/ffmpeg/abi.odin`, checked against the
-running library at startup.
+few unavoidable offsets in `vendor/ffmpeg/abi.odin`. CI runs `-self-test`
+against FFmpeg 6 (Ubuntu 24.04), 7 (Debian 13), 8 (the vendored Windows build)
+and 9 (Homebrew), which catches a release the bindings get wrong.
 
 To update the vendored Windows libraries see `scripts/fetch-libs.ps1`.
 
