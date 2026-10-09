@@ -2,16 +2,117 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#000000" />
     <title>Odysseus</title>
+    <link rel="icon" href="/odysseus/favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="/odysseus/style.css" />
   </head>
-  <body>
-    <header>
-      <h1>Odysseus</h1>
-      <p id="status">Connecting…</p>
-    </header>
-    <video id="stream" autoplay playsinline muted></video>
+  <body class="overlay-on ui-visible">
+    <svg class="sprite" aria-hidden="true" focusable="false">
+      <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h2M10 17h10" /><circle cx="16" cy="7" r="2" /><circle cx="8" cy="17" r="2" /></symbol>
+      <symbol id="i-expand" viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" /></symbol>
+      <symbol id="i-compress" viewBox="0 0 24 24"><path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5" /></symbol>
+      <symbol id="i-volume-off" viewBox="0 0 24 24"><path d="M4 9v6h4l5 4V5L8 9H4z" /><path d="M17 9.5l4 5M21 9.5l-4 5" /></symbol>
+      <symbol id="i-volume-on" viewBox="0 0 24 24"><path d="M4 9v6h4l5 4V5L8 9H4z" /><path d="M16.5 8.5a5 5 0 010 7M19 6a8.5 8.5 0 010 12" /></symbol>
+      <symbol id="i-pointer" viewBox="0 0 24 24"><path d="M6 3l13 7-5.5 1.8L11 18z" /></symbol>
+    </svg>
+
+    <main id="stage" class="stage">
+      <video id="stream" autoplay playsinline muted disablepictureinpicture></video>
+    </main>
+
+    <!-- Status overlay: never intercepts the pointer, so it cannot get in the way of remote control. -->
+    <div id="hud" class="hud fade">
+      <div class="card surface">
+        <div class="title-row">
+          <span id="dot" class="dot" data-tone="idle"></span>
+          <h1>Odysseus</h1>
+          <p id="status" role="status" aria-live="polite">Connecting…</p>
+        </div>
+        <dl id="stats" class="stats">
+          <div><dt>Video</dt><dd id="st-res">–</dd></div>
+          <div><dt>FPS</dt><dd id="st-fps">–</dd></div>
+          <div><dt>Bitrate</dt><dd id="st-rate">–</dd></div>
+          <div><dt>Loss</dt><dd id="st-loss">–</dd></div>
+          <div><dt>Buffer</dt><dd id="st-jit">–</dd></div>
+          <div><dt>Decoder</dt><dd id="st-dec">–</dd></div>
+          <div><dt>Encoder</dt><dd id="st-enc">–</dd></div>
+          <div><dt>Capture</dt><dd id="st-cap">–</dd></div>
+          <div><dt>Viewers</dt><dd id="st-view">–</dd></div>
+        </dl>
+      </div>
+    </div>
+
+    <div id="dock" class="dock">
+      <div class="dock-start">
+        <button type="button" id="unmute" class="pill surface fade" hidden>
+          <svg class="icon" aria-hidden="true"><use href="#i-volume-off" /></svg>
+          <span>Unmute</span>
+        </button>
+      </div>
+      <button type="button" id="control-pill" class="pill surface control-pill" hidden>
+        <svg class="icon" aria-hidden="true"><use href="#i-pointer" /></svg>
+        <span>Controlling</span>
+        <span class="pill-hint">Ctrl+Alt+Shift+Q to release</span>
+      </button>
+      <div class="dock-end">
+        <button type="button" id="settings-btn" class="handle surface fade" aria-label="Settings" aria-haspopup="dialog" aria-expanded="false" aria-controls="settings">
+          <svg class="icon" aria-hidden="true"><use href="#i-sliders" /></svg>
+          <span id="handle-dot" class="dot" data-tone="idle"></span>
+        </button>
+      </div>
+    </div>
+
+    <div id="settings" class="panel surface" role="dialog" aria-label="Viewer settings" hidden>
+      <div class="panel-head">
+        <h2>Settings</h2>
+        <p class="panel-status"><span id="panel-dot" class="dot" data-tone="idle"></span><span id="panel-status">Connecting…</span></p>
+      </div>
+
+      <div id="monitor-row" class="field" hidden>
+        <label for="monitor">Monitor</label>
+        <select id="monitor"></select>
+      </div>
+
+      <label class="check"><input type="checkbox" id="opt-overlay" /><span>Show overlay</span></label>
+      <label class="check"><input type="checkbox" id="opt-stats" /><span>Show statistics</span></label>
+
+      <div class="btn-row">
+        <button type="button" id="btn-fs" class="btn">
+          <svg class="icon" aria-hidden="true"><use id="fs-icon" href="#i-expand" /></svg>
+          <span id="fs-label">Fullscreen</span>
+        </button>
+        <button type="button" id="btn-audio" class="btn" hidden>
+          <svg class="icon" aria-hidden="true"><use id="audio-icon" href="#i-volume-off" /></svg>
+          <span id="audio-label">Unmute</span>
+        </button>
+      </div>
+
+      <div id="control-row" hidden>
+        <label class="check"><input type="checkbox" id="opt-control" /><span>Remote control</span></label>
+        <p class="hint">Mouse and keyboard go to the host. Ctrl+Alt+Shift+Q releases them.</p>
+      </div>
+
+      <p class="hint keys">Keys: O overlay, S statistics, F fullscreen, M sound</p>
+    </div>
+
+    <dialog id="auth" class="modal" aria-labelledby="auth-title">
+      <form id="auth-form" autocomplete="off">
+        <input type="text" name="username" value="odysseus" autocomplete="username" class="sr-only" tabindex="-1" aria-hidden="true" />
+        <h2 id="auth-title">Password required</h2>
+        <p id="auth-hint" class="hint">Enter the viewing password for this host.</p>
+        <label id="auth-label" for="auth-input">Password</label>
+        <input id="auth-input" type="password" autocomplete="current-password" autocapitalize="off" spellcheck="false" required />
+        <p id="auth-error" class="err" role="alert"></p>
+        <div class="btn-row end">
+          <button type="button" id="auth-cancel" class="btn" hidden>Cancel</button>
+          <button type="submit" id="auth-submit" class="btn primary">Connect</button>
+        </div>
+      </form>
+    </dialog>
+
     <script src="/odysseus/app.js"></script>
   </body>
 </html>

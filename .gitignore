@@ -1,20 +1,33 @@
+# Build output
+/build/
 *.exe
 *.pdb
 *.obj
+*.o
+*.a
 *.ll
 *.bc
 /*.dll
-/build/*
+odysseus.log
+
+# Editors, OS, tools
 .DS_Store
 .serena/
 .cursor/
 .vscode/
+.claude/settings.local.json
 /tools/
+
+# Native library sources and build trees (see scripts/fetch-libs.*)
 vendor/ffmpeg/_extracted/
 vendor/ffmpeg/_ffmpeg.zip
 vendor/libdatachannel/upstream/
 vendor/libdatachannel/build/
+vendor/libdatachannel/build-unix/
+vendor/libdatachannel/.cache/
 vendor/libdatachannel/bin/*.def
 vendor/libdatachannel/lib/*.dll.a
+vendor/libdatachannel/lib/*.so*
+vendor/libdatachannel/lib/*.dylib
 vendor/mbedtls/
 initREPO.sh

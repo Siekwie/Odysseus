@@ -1,333 +1,285 @@
 # Odysseus
 
-Odysseus is a low-latency local-network screen sharing application written in
-[Odin](https://odin-lang.org/).
+Odysseus is a low-latency screen sharing application for the local network,
+written in [Odin](https://odin-lang.org/).
 
-It captures the host computer’s screen, encodes it with FFmpeg, and streams it to
-web browsers using WebRTC.
-
-Open the stream from another device on the same local network:
-
-```text
-http://<streaming-computer-ip>:<port>/odysseus
-```
-
-Example:
+It captures the host computer's screen and system audio, encodes them with
+FFmpeg (H.264 + Opus) and streams them to web browsers over WebRTC. Viewers
+need nothing but a browser:
 
 ```text
-http://192.168.178.42:8080/odysseus
+http://<streaming-computer-ip>:8080/odysseus
 ```
 
-Odysseus is designed for LAN use. It does not require an external service,
-account, STUN server, or TURN server for devices that can directly reach each
-other on the same network.
+There is no account, no cloud service and no STUN/TURN server involved:
+devices that can reach each other on the same network connect directly.
 
 ## Features
 
-- Real-time desktop capture
-- Low-latency streaming with WebRTC
-- Browser playback through a native HTML `<video>` element
-- FFmpeg-based H.264 video encoding
-- Hardware encoding where supported
-- Mouse cursor included in the stream
-- Local-network-first design
-- Simple browser access through `/odysseus`
-- Automatic WebRTC reconnect handling
-- Configurable resolution, FPS, bitrate, and port
+- Real-time desktop capture on Windows, Linux (X11 and Wayland) and macOS
+- H.264 over WebRTC, played by a plain `<video>` element with the browser's hardware decoder
+- Hardware encoding where it works (NVENC, AMF, Quick Sync, VAAPI, VideoToolbox, Media Foundation), software fallback (x264 / OpenH264); the first encoder that actually opens is used
+- Zero-copy capture → encode on Windows with NVENC (the frame never leaves the GPU; AMF uses the same path but has not been tested on AMD hardware)
+- System audio (what the speakers play) as stereo Opus
+- Mouse cursor in the stream
+- Monitor selection from the command line or from the viewer
+- Optional remote control (mouse and keyboard), protected by a password or PIN
+- Optional viewing password
+- Viewer with auto-hiding overlay, live statistics, fullscreen, mobile layout and automatic reconnect
+- Several viewers at once share one capture/encode pipeline; capture runs only while someone is watching
 
-## Architecture
+## Platform support
 
-```text
-Screen Capture
-  → Frame conversion / scaling
-  → FFmpeg video encoder
-  → WebRTC video track
-  → Browser <video> element
-```
+| | Capture | Hardware encode | Audio | Remote control | Status |
+| --- | --- | --- | --- | --- | --- |
+| **Windows 10/11** | Desktop Duplication (DXGI), GDI fallback | NVENC, AMF, Quick Sync, Media Foundation | WASAPI loopback | `SendInput` | Tested end to end |
+| **Linux, X11** | FFmpeg `x11grab` | NVENC, VAAPI, Quick Sync | PulseAudio / PipeWire-Pulse monitor | XTest | Tested end to end |
+| **Linux, Wayland** | xdg-desktop-portal + PipeWire | NVENC, VAAPI, Quick Sync | PulseAudio / PipeWire-Pulse monitor | RemoteDesktop portal (GNOME, KDE) | Capture tested on wlroots (sway); portal input untested |
+| **macOS 12.3+** | AVFoundation (default), ScreenCaptureKit (`-capture:screencapturekit`) | VideoToolbox | ScreenCaptureKit system audio (macOS 13+) | CoreGraphics events | Build, unit tests and encoder self-test pass in CI; capture, audio and input not yet run on real hardware |
 
-WebRTC is used for media delivery instead of sending individual image frames over
-WebSockets.
+On Linux, Intel and AMD GPUs encode through VAAPI (needs FFmpeg 8 or 9 on
+x86-64). That path shares its code with a CUDA-pool variant that is tested,
+but it has not been run on VAAPI hardware; if it fails to open or to encode,
+Odysseus moves on to the next encoder by itself.
 
-WebSockets may still be used internally for WebRTC signaling, such as exchanging
-SDP offers, answers, and ICE candidates. The video stream itself is transported
-by WebRTC.
+## Quick start
 
-## Requirements
+### Windows
 
-### Host computer
-
-- Odin compiler
-- Windows x64 (Linux/macOS capture is later)
-- Vendored FFmpeg 8.x and libdatachannel under `vendor/` (already in this repo for Windows)
-- A compatible H.264 encoder at runtime (NVENC / QSV / AMF, or libx264 from the GPL FFmpeg build)
-
-### Viewer computer
-
-- A modern browser with WebRTC support:
-  - Chrome
-  - Firefox
-  - Microsoft Edge
-  - Safari
-
-Both devices must be connected to the same local network.
-
-## Installation
-
-### 1. Install Odin
-
-Install Odin using the official instructions:
-
-```text
-https://odin-lang.org/docs/install/
-```
-
-Verify the installation:
-
-```bash
-odin version
-```
-
-### 2. Native libraries (Windows)
-
-FFmpeg 8.1 (BtbN `win64-gpl-shared`, includes libx264) and libdatachannel are
-vendored under `vendor/ffmpeg` and `vendor/libdatachannel`. You do not need a
-system FFmpeg install.
-
-To rebuild libdatachannel from source (MinGW + CMake):
+FFmpeg 8.1 (BtbN `win64-gpl-shared`) and libdatachannel are vendored under
+`vendor/`, so the only thing to install is the
+[Odin compiler](https://odin-lang.org/docs/install/).
 
 ```powershell
-.\scripts\fetch-libs.ps1
-```
-
-### 3. Clone and build
-
-```powershell
-git clone https://github.com/<your-user>/Odysseus.git
+git clone https://github.com/Siekwie/Odysseus.git
 cd Odysseus
-.\build.ps1
-```
-
-`build.ps1` compiles to `build/odysseus.exe` and copies the vendored DLLs
-into `build/`. This Odin nightly has no `-config:` flag; bindings use the real
-libs automatically when `vendor/*/lib/*.lib` exist.
-
-## Usage
-
-### Start streaming
-
-Run Odysseus on the computer whose screen should be shared:
-
-```bash
-./build/odysseus
-```
-
-On Windows:
-
-```powershell
 .\build.ps1
 .\build\odysseus.exe
 ```
 
-By default, the server listens on `0.0.0.0:8080` (all IPv4 interfaces). Use
-`-bind:` to listen on one LAN NIC; the same address is used for WebRTC ICE host
-candidates. `-max-viewers:` caps concurrent streams (default 8). `-max-http:`
-caps concurrent HTTP connections (default 64).
+If Windows Firewall asks, allow Odysseus on private networks.
 
-### Find the streaming computer IP address
+### Linux
 
-#### Linux
-
-```bash
-hostname -I
-```
-
-#### macOS
+Install Odin, FFmpeg (6, 7, 8 or 9) with development files, and libdatachannel
+0.20 or newer. PipeWire and GLib development files are optional and enable
+Wayland capture.
 
 ```bash
-ipconfig getifaddr en0
+# Arch
+sudo pacman -S odin ffmpeg libdatachannel pipewire pkgconf clang
+
+# Debian / Ubuntu (libdatachannel is built from source by fetch-libs.sh)
+sudo apt install clang pkg-config cmake libssl-dev ffmpeg libavcodec-dev libavformat-dev \
+  libavdevice-dev libavutil-dev libswscale-dev libpipewire-0.3-dev libglib2.0-dev
+./scripts/fetch-libs.sh
+
+./build.sh
+./build/odysseus
 ```
 
-#### Windows
+At run time the X11 libraries (`libX11`, `libXrandr`, `libXtst`) and
+`libpulse` are loaded only if present; none of them is required.
+
+On Wayland the desktop asks which screen to share the first time a viewer
+connects. The choice is remembered, so it asks only once. If you decline, or
+stop the share from the desktop, viewers are told and cannot trigger the
+dialog again for 30 seconds.
+
+### macOS
 
 ```bash
-ipconfig
+brew install odin ffmpeg pkg-config cmake openssl@3
+./scripts/fetch-libs.sh        # builds libdatachannel (Homebrew has no formula for it)
+./build.sh
+./build/odysseus
 ```
 
-Look for the local IPv4 address, usually similar to:
+macOS asks for the **Screen Recording** permission on first use (and for
+**Accessibility** when started with `-input`). Grant it to the terminal you
+start Odysseus from. System audio needs macOS 13 or newer.
+
+## Usage
+
+Start Odysseus on the computer whose screen should be shared. It prints the
+addresses viewers can open:
 
 ```text
-192.168.x.x
+19:05:45 info   Odysseus 1.0.0 (libavcodec 62, libavutil 60)
+19:05:45 info   open http://192.168.2.178:8080/odysseus
 ```
 
-or:
+Open that address in a browser on another device. The viewer starts playing
+as soon as the connection is up. Move the pointer (or tap) to bring up the
+overlay; the button in the lower right opens the settings:
 
-```text
-10.x.x.x
-```
+- **Monitor**: switch the captured monitor (applies to every viewer)
+- **Show overlay** / **Show statistics**: what is drawn over the video (remembered per browser)
+- **Fullscreen**, **Unmute**
+- **Remote control**: only when the host was started with `-input`
 
-### Open the stream
+Keyboard shortcuts: `O` overlay, `S` statistics, `F` fullscreen, `M` sound.
+While controlling the host, every key goes to the host; `Ctrl+Alt+Shift+Q`
+releases control.
 
-From another device on the same network, open:
-
-```text
-http://<host-ip>:8080/odysseus
-```
-
-For example:
-
-```text
-http://192.168.178.42:8080/odysseus
-```
-
-The browser connects to the Odysseus signaling endpoint, establishes a direct
-WebRTC connection, and displays the host screen in a video element.
+Any modern browser with WebRTC and H.264 works: Chrome, Edge, Safari, and
+Firefox (which may need its OpenH264 plugin enabled).
 
 ## Configuration
 
-Odysseus can be configured through command-line flags.
+Flags use Odin style, `-name:value`. Run `odysseus -help` for the full list.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `-port:8080` | 8080 | HTTP port |
+| `-bind:<address>` | all IPv4 interfaces | Listen address; also used for WebRTC |
+| `-monitor:<n>` | 0 | Monitor to capture; see `-list-monitors` |
+| `-fps:<n>` | 30 | Capture and encode rate |
+| `-bitrate:<kbps>` | 8000 | Video bitrate |
+| `-width:<px>` `-height:<px>` | 0 (native) | Output size. Set one to keep the aspect ratio. Scaling runs on the CPU and disables the zero-copy path |
+| `-encoder:<name>` | `h264` | `h264` picks the best working encoder; or name an FFmpeg encoder such as `h264_nvenc`, `libx264` |
+| `-capture:<backend>` | `auto` | `dxgi`, `gdigrab`, `x11`, `pipewire`, `avfoundation`, `screencapturekit` |
+| `-cursor:false` | on | Leave the mouse cursor out of the stream |
+| `-audio:false` | on | Do not stream audio |
+| `-audio-device:<name>` | default output | Capture another device (substring of its name; a PulseAudio source name on Linux) |
+| `-audio-bitrate:<kbps>` | 128 | Opus bitrate |
+| `-password:<text>` | none | Viewers must enter this password |
+| `-input` | off | Allow remote control (see below) |
+| `-max-viewers:<n>` | 8 | Concurrent viewers |
+| `-max-http:<n>` | 64 | Concurrent HTTP connections |
+| `-host-name:<names>` | none | Extra host names accepted in the URL (comma separated) |
+| `-log:<path>` | `odysseus.log` next to the executable | `none` disables the log file |
+| `-verbose` | off | Debug output, including FFmpeg and WebRTC library messages |
+| `-list-monitors` | | Print the monitors and exit |
+| `-list-encoders` | | Probe which H.264 encoders work on this machine and exit |
+| `-self-test` | | Encode synthetic video and audio to verify the encoders and the linked FFmpeg, then exit |
+
+Example for a smooth 1080p60 stream:
 
 ```bash
-./build/odysseus \
-  -bind:0.0.0.0 \
-  -port:8080 \
-  -fps:30 \
-  -width:1920 \
-  -height:1080 \
-  -bitrate:8000 \
-  -encoder:h264 \
-  -cursor:true \
-  -max-viewers:8 \
-  -max-http:64
+./build/odysseus -fps:60 -height:1080 -bitrate:16000
 ```
 
-The mouse cursor is drawn into the stream by default. Disable it with `-cursor:false`.
+Suggested bitrates:
 
-Example for a smooth 1080p 60 FPS LAN stream:
+| Preset | Resolution | FPS | Bitrate |
+| --- | ---: | --: | ---: |
+| Low bandwidth | 1280×720 | 30 | 3–5 Mbps |
+| Balanced | 1920×1080 | 30 | 6–10 Mbps |
+| Smooth | 1920×1080 | 60 | 12–20 Mbps |
+| Text / UI quality | native | 30 | 10–25 Mbps |
 
-```bash
-./build/odysseus \
-  -port:8080 \
-  -fps:60 \
-  -width:1920 \
-  -height:1080 \
-  -bitrate:16000 \
-  -encoder:h264_nvenc
-```
+When the screen is static Odysseus sends almost nothing: frames are encoded
+when the desktop changes, briefly afterwards so a still image sharpens, and
+once a second as a keepalive.
 
-Suggested settings:
+## Remote control
 
-| Preset            |        Resolution | FPS |    Bitrate |
-| ----------------- | ----------------: | --: | ---------: |
-| Low bandwidth     |          1280×720 |  30 |   3–5 Mbps |
-| Balanced          |         1920×1080 |  30 |  6–10 Mbps |
-| Smooth            |         1920×1080 |  60 | 12–20 Mbps |
-| Text / UI quality | Native resolution |  30 | 10–25 Mbps |
+`-input` lets viewers move the mouse and type on the host. Because that hands
+over the machine, it is never open to everyone on the network:
 
-Actual bitrate requirements depend on desktop motion, monitor resolution, and
-network quality.
+- with `-password:<text>`, the viewing password also unlocks control;
+- without one, Odysseus prints an eight-digit PIN at startup and the viewer
+  asks for it when "Remote control" is switched on.
 
-## Encoders
+Five wrong attempts lock that address out, for longer each time. Keys and
+buttons held by a viewer are released when that viewer disconnects.
 
-Odysseus should prefer a hardware encoder when supported by the host system.
+On Wayland, remote control goes through the desktop's RemoteDesktop portal
+(GNOME and KDE have it; wlroots compositors do not).
 
-Possible FFmpeg encoder names include:
+## Security notes
+
+Odysseus is meant for a network you trust.
+
+- Traffic to the page and the signaling WebSocket is plain HTTP; the media
+  itself is encrypted by WebRTC (DTLS-SRTP), but a password or PIN can be read
+  by anyone who can sniff the network. Do not expose the port to the internet.
+- The signaling socket only accepts same-origin requests, and the server only
+  answers to IP addresses, `localhost`, the machine's own name and names given
+  with `-host-name`. This keeps websites you visit on a viewer device from
+  reaching an Odysseus host behind your back (cross-site WebSocket hijacking,
+  DNS rebinding).
+- Anyone who can open the page can watch unless `-password` is set.
+- One address can hold at most 16 connections, and a connection that does not
+  authenticate within two minutes is dropped, so a single device cannot lock
+  everyone else out.
+
+## Network notes
+
+- The host must accept incoming TCP on the HTTP port and UDP for WebRTC.
+- Guest Wi-Fi with client isolation, VPNs and strict firewalls can prevent the
+  direct connection WebRTC needs. No STUN or TURN server is used.
+
+## How it works
 
 ```text
-h264_nvenc       NVIDIA GPU
-h264_qsv         Intel Quick Sync
-h264_amf         AMD GPU
-h264_videotoolbox macOS hardware encoder
-h264_vaapi       Linux VAAPI
-libx264          Software fallback
+capture backend ─► (BGRA frame or GPU texture)
+  ─► swscale to NV12 / zero-copy D3D11        src/core
+  ─► FFmpeg H.264 encoder ─► AVCC access units
+  ─► libdatachannel RTP packetizer ─► WebRTC   src/network
+  ─► browser <video>
+
+system audio ─► 20 ms frames ─► libopus ─► WebRTC audio track   src/audio
 ```
 
-Check which encoders are available:
-
-```bash
-ffmpeg -encoders | grep 264
-```
-
-On Windows PowerShell:
-
-```powershell
-ffmpeg -encoders | Select-String 264
-```
-
-For interactive screen sharing, use low-latency encoder settings:
-
-- H.264 codec
-- 30 or 60 FPS
-- short keyframe interval, around 1–2 seconds
-- no B-frames when low latency is preferred
-- frame dropping instead of queueing old frames
-- hardware encoding where possible
-
-## Network Notes
-
-Odysseus is intended for a local network.
-
-- The host computer must allow incoming connections on the configured HTTP port.
-- Devices must be able to reach each other directly.
-- Guest Wi-Fi networks may block device-to-device traffic.
-- VPNs, client isolation, or restrictive firewalls can prevent WebRTC negotiation.
-- No public STUN or TURN server is needed for normal LAN usage.
-
-If Windows Firewall asks for permission, allow Odysseus on private networks.
-
-## Project Structure
+WebSockets carry only signaling (SDP, ICE candidates, monitor switches, input
+events); see `src/network/signaling.odin` for the protocol.
 
 ```text
 Odysseus/
-├── main.odin                 Application entry point
-├── build.ps1                 Compiles into build/
-├── build/                    Exe + runtime DLLs (created by build.ps1)
+├── main.odin, signaling.odin   Entry point and signaling handlers
+├── build.ps1 / build.sh        Build scripts (release, debug, test, check)
+├── scripts/                    fetch-libs.ps1 / fetch-libs.sh, link-flags.sh
 ├── src/
-│   ├── core/                 Platform-specific screen capture, FFmpeg Encoding, ...
-│   ├── network/              WebRTC peer connection and media handling
-│   ├── server/               Routes and local web server
-│   ├── utils/                CLI flags and configuration and utils
-│   ├── web/
-│       ├── odysseus/              Browser viewer page
-│       │   ├── index.html
-│       │   ├── app.js
-│       │   └── style.css
-│       └── assets/              Probably not needed
-├── vendor/
-│   ├── ffmpeg/               FFmpeg 8.x Odin bindings + vendored win64 libs/DLLs
-│   └── libdatachannel/       libdatachannel C API bindings + vendored win64 libs/DLLs
-└── README.md
+│   ├── core/                   Capture backends, encoders, H.264 bitstream helpers
+│   ├── audio/                  System audio capture and Opus encoding
+│   ├── input/                  Remote input backends and key map
+│   ├── network/                WebRTC peer, SDP parsing, signaling messages
+│   ├── server/                 HTTP server and WebSocket
+│   ├── stream/                 The capture → encode → send session
+│   ├── utils/                  Configuration, logging, crash and shutdown handling
+│   ├── native/                 C / Objective-C shims (PipeWire portal, ScreenCaptureKit)
+│   └── web/odysseus/           Viewer page (embedded into the executable)
+├── tests/                      Unit test runner and headless end-to-end tests
+└── vendor/                     FFmpeg and libdatachannel bindings (+ Windows binaries)
 ```
 
-## Development Goals
+## Development
 
-- [x] Windows screen capture support
-- [x] FFmpeg H.264 encoding through Odin C interop
-- [x] Hardware encoder detection
-- [x] WebRTC signaling server
-- [x] Browser viewer at `/odysseus`
-- [x] Mouse cursor capture
-- [ ] Configurable monitor selection and checkbox to enable/disable text/UI overlay
-- [ ] Linux PipeWire capture support (LATER)
-- [ ] macOS ScreenCaptureKit support (LATER)
-- [ ] Audio streaming (LATER)
-- [ ] Remote input support, optionally (LATER)
-
-## Why WebRTC Instead of Raw WebSockets?
-
-Sending screen frames directly over WebSockets often requires the browser to
-manually decode images or video data and draw them to a canvas. This can add CPU
-usage, latency, buffering, and poor frame rates.
-
-WebRTC allows the browser to use its optimized media pipeline:
-
-```text
-Encoded H.264 video
-  → browser hardware decoder
-  → HTML video element
+```bash
+./build.sh test          # unit tests            (.\build.ps1 test on Windows)
+./build.sh check         # type-check all targets without linking
+./build/odysseus -self-test   # encoders + FFmpeg ABI check, no screen or network needed
+bash tests/e2e/run.sh -- -monitor:1          # headless browser against a real capture
+E2E_XVFB=1 bash tests/e2e/run.sh             # Linux: private X server with a test pattern
+bash tests/e2e/wayland.sh                    # Linux: headless sway + portal + PipeWire
 ```
 
-This makes 30 FPS and 60 FPS streaming substantially more realistic than a
-JPEG/PNG-over-WebSocket approach.
+The end-to-end tests start Odysseus, drive a headless Chrome or Edge through
+the DevTools protocol (Node 22+, no npm packages) and check what the browser
+actually decoded.
+
+FFmpeg's struct layouts differ between releases. The bindings in
+`vendor/ffmpeg` therefore configure codecs through AVOptions only and keep the
+few unavoidable offsets in `vendor/ffmpeg/abi.odin`. CI runs `-self-test`
+against FFmpeg 6 (Ubuntu 24.04), 7 (Debian 13), 8 (the vendored Windows build)
+and 9 (Homebrew), which catches a release the bindings get wrong.
+
+To update the vendored Windows libraries see `scripts/fetch-libs.ps1`.
+
+## Troubleshooting
+
+- **Black or frozen picture, "Waiting for the host…"**: run with `-verbose`
+  and check `-list-encoders`; try `-encoder:libx264`.
+- **No picture on Wayland**: the portal dialog may be waiting on the host's
+  screen. `ODYSSEUS_PW_DEBUG=1` prints each portal and PipeWire step.
+- **Viewer says "This browser has no H.264 decoder"**: enable OpenH264 in
+  Firefox's add-on settings, or use another browser.
+- **No sound**: the video starts muted because browsers require it for
+  autoplay; press "Unmute". On Linux check that `pactl info` works.
+- **"Odysseus does not answer to this host name"**: open the page by IP
+  address or start the host with `-host-name:<name>`.
 
 ## License
 
